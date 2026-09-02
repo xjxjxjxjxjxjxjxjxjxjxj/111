@@ -1,0 +1,12 @@
+# AURIX build outputs
+Debug/
+Release/
+.settings/
+*.o
+*.d
+*.elf
+*.map
+*.lst
+*.bcf
+*.lsl
+.ipr/
