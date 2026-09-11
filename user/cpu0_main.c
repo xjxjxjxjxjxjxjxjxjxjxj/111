@@ -53,14 +53,14 @@
 
 /* Roundabout gap recognition. All values are deliberately easy to tune. */
 #define EDGE_SAMPLE_COUNT               (10)
-#define GAP_REFERENCE_CENTER_RANGE      (15)
+#define GAP_REFERENCE_CENTER_RANGE      (20)
 #define GAP_SECOND_REFERENCE_CENTER_RANGE (25)
 #define GAP_CENTER_SUM_TARGET           (IMG_COL)
-#define GAP_CENTER_SUM_OFFSET_MIN       (45)
+#define GAP_CENTER_SUM_OFFSET_MIN       (30)
 #define GAP_LOST_COUNT_MIN              (6)
 #define GAP_LOST_RUN_MIN                (4)
 #define GAP_OPPOSITE_VALID_MIN          (9)
-#define GAP_CONFIRM_FRAMES              (5)
+#define GAP_CONFIRM_FRAMES              (4)
 #define GAP_SECOND_CONFIRM_FRAMES       (2)
 #define GAP_RELEASE_FRAMES              (3)
 #define SECOND_GAP_TIMEOUT_REFERENCE_FRAMES (150)
@@ -69,7 +69,7 @@
 #define FORCED_LEFT_EDGE_COL            (45)
 #define FORCED_RIGHT_EDGE_COL           (143)
 #define EDGE_BORDER_LOST_MARGIN         (6)
-#define GAP_OPPOSITE_EDGE_TOLERANCE     (20)
+#define GAP_OPPOSITE_EDGE_TOLERANCE     (28)
 #define PID_NEUTRAL_DEADBAND            (3)
 
 /* Roundabout control and exit recognition. */
