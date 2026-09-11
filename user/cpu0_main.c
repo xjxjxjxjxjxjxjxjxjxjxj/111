@@ -53,14 +53,14 @@
 
 /* Roundabout gap recognition. All values are deliberately easy to tune. */
 #define EDGE_SAMPLE_COUNT               (10)
-#define GAP_REFERENCE_CENTER_RANGE      (25)
+#define GAP_REFERENCE_CENTER_RANGE      (15)
 #define GAP_SECOND_REFERENCE_CENTER_RANGE (25)
 #define GAP_CENTER_SUM_TARGET           (IMG_COL)
-#define GAP_CENTER_SUM_OFFSET_MIN       (25)
+#define GAP_CENTER_SUM_OFFSET_MIN       (45)
 #define GAP_LOST_COUNT_MIN              (6)
 #define GAP_LOST_RUN_MIN                (4)
 #define GAP_OPPOSITE_VALID_MIN          (9)
-#define GAP_CONFIRM_FRAMES              (3)
+#define GAP_CONFIRM_FRAMES              (5)
 #define GAP_SECOND_CONFIRM_FRAMES       (2)
 #define GAP_RELEASE_FRAMES              (3)
 #define SECOND_GAP_TIMEOUT_REFERENCE_FRAMES (150)
@@ -69,7 +69,7 @@
 #define FORCED_LEFT_EDGE_COL            (45)
 #define FORCED_RIGHT_EDGE_COL           (143)
 #define EDGE_BORDER_LOST_MARGIN         (6)
-#define GAP_OPPOSITE_EDGE_TOLERANCE     (35)
+#define GAP_OPPOSITE_EDGE_TOLERANCE     (20)
 #define PID_NEUTRAL_DEADBAND            (3)
 
 /* Roundabout control and exit recognition. */
@@ -1057,6 +1057,7 @@ void core0_main (void)
     uint8 both_edges_recovered;
     uint8 reference_near_center;
     uint8 boundary_assist_active;
+    uint8 gap_side_lost;
 #if !RING_ONLY_TEST
     float steering_output;
     int8 steering_turn;
@@ -1224,13 +1225,29 @@ void core0_main (void)
 
         if(ring_state == RING_STATE_WAIT_SECOND_GAP)
         {
-            boundary_assist_active = 1;
-            control_z = get_boundary_assisted_z(
-                ring_direction,
-                current_left_edge_average,
-                current_right_edge_average,
-                current_left_valid_count,
-                current_right_valid_count);
+            /*
+             * Only trust a first-gap observation when the gap-side boundary is
+             * really lost. A big curve that merely shifts the geometry must not
+             * force a virtual boundary, which would steer the car off track.
+             */
+            gap_side_lost = (uint8)(
+                (ring_direction == RING_DIRECTION_LEFT
+                 && is_left_edge_lost(current_left_edge_average,
+                                      current_left_valid_count))
+             || (ring_direction == RING_DIRECTION_RIGHT
+                 && is_right_edge_lost(current_right_edge_average,
+                                       current_right_valid_count)));
+
+            if(gap_side_lost)
+            {
+                boundary_assist_active = 1;
+                control_z = get_boundary_assisted_z(
+                    ring_direction,
+                    current_left_edge_average,
+                    current_right_edge_average,
+                    current_left_valid_count,
+                    current_right_valid_count);
+            }
         }
         else if(ring_state == RING_STATE_EXIT_TURN
         || ring_state == RING_STATE_EXIT_TRACK
