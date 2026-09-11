@@ -1,0 +1,17 @@
+# Build output
+Debug/
+Release/
+Debug_*/
+*.o
+*.obj
+*.d
+*.src
+*.mk
+*.opt
+*.map
+*.elf
+*.hex
+*.mdf
+*.bin
+*.abs
+*.out
