@@ -41,16 +41,15 @@
 #define INNER_REVERSE_MAX_PERCENT      (35)
 #define MAX_DUTY                       (50)
 #define PID_OUTPUT_SCALE               (60.0f)
+/* First-order derivative filter coefficient: 0 = no filtering, ->1 smoother. */
+#define PID_D_FILTER_ALPHA             (0.5f)
 #define STEERING_COMMAND_MAX           (BASE_SPEED_PERCENT + INNER_REVERSE_MAX_PERCENT)
 
 #define CAMERA_SAFE_STOP_TIMEOUT_MS    (100)
 #define CPU1_SAFE_STOP_TIMEOUT_MS      (50)
 
-/* Longest-white-column speed control. PID steering always remains at 100%. */
+/* Longest-white-column reference. PID steering always remains at 100%. */
 #define REFERENCE_CENTER_COL            (IMG_COL / 2)
-#define REFERENCE_SPEED_IN_RANGE        (12)
-#define REFERENCE_SPEED_OUT_RANGE       (25)
-#define TURN_SPEED_REDUCTION_PERCENT    (0)
 
 /* Roundabout gap recognition. All values are deliberately easy to tune. */
 #define EDGE_SAMPLE_COUNT               (10)
@@ -151,11 +150,10 @@ typedef struct
     float error;
     float error_last;
     float error_integral;
+    float derivative_filtered;
     float output;
     float output_max;
     float output_min;
-    float err_buf[5];
-    uint8 buf_idx;
 } pid_struct;
 
 static pid_struct pid_pos =
@@ -256,40 +254,6 @@ static uint8 are_both_edges_recovered (uint16 left_edge_average,
      && !is_left_edge_lost(left_edge_average, left_valid_count)
      && !is_right_edge_lost(right_edge_average, right_valid_count)
      && right_edge_average > left_edge_average);
-}
-
-/*
- * Slow down as the longest-white reference leaves the centre area.  The same
- * two ranges make the requested curve speed reduction change smoothly.
- */
-static uint16 get_image_base_speed_percent (uint16 reference_col,
-                                             uint8 reference_valid)
-{
-    int offset;
-    int curve_speed = clamp_int(BASE_SPEED_PERCENT
-                              - TURN_SPEED_REDUCTION_PERCENT,
-                                0,
-                                BASE_SPEED_PERCENT);
-
-    if(!reference_valid)
-    {
-        return (uint16)curve_speed;
-    }
-
-    offset = abs((int)reference_col - REFERENCE_CENTER_COL);
-    if(offset <= REFERENCE_SPEED_IN_RANGE)
-    {
-        return BASE_SPEED_PERCENT;
-    }
-    if(offset >= REFERENCE_SPEED_OUT_RANGE)
-    {
-        return (uint16)curve_speed;
-    }
-
-    return (uint16)(BASE_SPEED_PERCENT
-          - (offset - REFERENCE_SPEED_IN_RANGE)
-          * TURN_SPEED_REDUCTION_PERCENT
-          / (REFERENCE_SPEED_OUT_RANGE - REFERENCE_SPEED_IN_RANGE));
 }
 
 /*
@@ -683,35 +647,60 @@ static uint16 get_dian (const uint8 *image)
     return average;
 }
 
-static float pid_calc (pid_struct *pid, float current_value)
+static float pid_calc (pid_struct *pid,
+                       float current_value,
+                       int8 *turn_direction)
 {
-    uint8 i;
+    float derivative;
 
     pid->current = current_value;
     if(pid->target >= pid->current)
     {
         pid->error = pid->target - pid->current;
-        turn_y = 1;
+        if(turn_direction != 0)
+        {
+            *turn_direction = 1;
+        }
     }
     else
     {
         pid->error = pid->current - pid->target;
-        turn_z = 1;
+        if(turn_direction != 0)
+        {
+            *turn_direction = -1;
+        }
     }
 
-    pid->err_buf[pid->buf_idx] = pid->error;
-    pid->buf_idx = (uint8)((pid->buf_idx + 1U) % 5U);
-
-    pid->error_integral = 0.0f;
-    for(i = 0; i < 5U; i++)
+    /*
+     * Accumulate a true integral with anti-windup. The integral contribution is
+     * clamped to the output range so it cannot wind up while saturated.
+     */
+    if(pid->ki != 0.0f)
     {
-        pid->error_integral += pid->err_buf[i];
+        pid->error_integral += pid->error;
+        if(pid->error_integral > pid->output_max / pid->ki)
+        {
+            pid->error_integral = pid->output_max / pid->ki;
+        }
+        else if(pid->error_integral < pid->output_min / pid->ki)
+        {
+            pid->error_integral = pid->output_min / pid->ki;
+        }
     }
+    else
+    {
+        pid->error_integral = 0.0f;
+    }
+
+    /* First-order low-pass on the derivative term to reject image noise. */
+    derivative = pid->error - pid->error_last;
+    pid->error_last = pid->error;
+    pid->derivative_filtered = PID_D_FILTER_ALPHA * pid->derivative_filtered
+                             + (1.0f - PID_D_FILTER_ALPHA) * derivative;
 
     pid->output = pid->kp * pid->error
                 + pid->ki * pid->error_integral
-                + pid->kd * (pid->error - pid->error_last);
-    pid->error_last = pid->error;
+                + pid->kd * pid->derivative_filtered;
 
     /*
      * The RT1064 source declared this function as uint8 even though it returns
@@ -731,17 +720,11 @@ static float pid_calc (pid_struct *pid, float current_value)
 
 static void pid_reset (pid_struct *pid)
 {
-    uint8 i;
-
     pid->error = 0.0f;
     pid->error_last = 0.0f;
     pid->error_integral = 0.0f;
+    pid->derivative_filtered = 0.0f;
     pid->output = 0.0f;
-    pid->buf_idx = 0;
-    for(i = 0; i < 5U; i++)
-    {
-        pid->err_buf[i] = 0.0f;
-    }
 }
 
 /*
@@ -750,8 +733,6 @@ static void pid_reset (pid_struct *pid)
  */
 static void pid_track_without_output (pid_struct *pid, float current_value)
 {
-    uint8 i;
-
     pid->current = current_value;
     if(pid->target >= pid->current)
     {
@@ -764,13 +745,8 @@ static void pid_track_without_output (pid_struct *pid, float current_value)
 
     pid->error_last = pid->error;
     pid->error_integral = 0.0f;
+    pid->derivative_filtered = 0.0f;
     pid->output = 0.0f;
-    pid->buf_idx = 0;
-    for(i = 0; i < 5U; i++)
-    {
-        pid->err_buf[i] = pid->error;
-        pid->error_integral += pid->error;
-    }
 }
 
 static void update_ring_state (ring_direction_t gap_event,
@@ -1083,6 +1059,7 @@ void core0_main (void)
     uint8 boundary_assist_active;
 #if !RING_ONLY_TEST
     float steering_output;
+    int8 steering_turn;
 #endif
     int steering_command;
     int ring_turn_command;
@@ -1200,9 +1177,7 @@ void core0_main (void)
         reference_near_center = (uint8)(current_reference_valid
             && abs((int)current_reference_col - REFERENCE_CENTER_COL)
                <= GAP_REFERENCE_CENTER_RANGE);
-        image_base_speed_percent = get_image_base_speed_percent(
-            current_reference_col,
-            current_reference_valid);
+        image_base_speed_percent = BASE_SPEED_PERCENT;
         current_second_gap_timeout_frames = get_second_gap_timeout_frames(
             image_base_speed_percent);
 
@@ -1349,8 +1324,11 @@ void core0_main (void)
             pid_reset(&pid_pos);
             motor_apply_steering_at_speed(0, image_base_speed_percent);
 #else
-            steering_output = pid_calc(&pid_pos, (float)control_z)
+            steering_output = pid_calc(&pid_pos, (float)control_z,
+                                       &steering_turn)
                             / PID_OUTPUT_SCALE;
+            turn_y = (steering_turn > 0) ? 1 : 0;
+            turn_z = (steering_turn < 0) ? 1 : 0;
             /* Longest-white position no longer scales PID: apply full output. */
             steering_command = (int)(steering_output + 0.5f);
             motor_apply_steering_at_speed(steering_command,
