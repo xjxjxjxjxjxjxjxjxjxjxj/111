@@ -230,6 +230,13 @@ class CameraReleaseTests(unittest.TestCase):
         self.assertFalse(any("kill -" in item for item in commands))
 
 
+class StartRunRemotePathTests(unittest.TestCase):
+    def test_remote_video_parent_uses_posix_dirname(self):
+        source = (EXECUTION_DIR / "start_run.py").read_text(encoding="utf-8")
+        self.assertIn('posixpath.dirname(request["remote_video_partial"])', source)
+        self.assertNotIn('Path(request["remote_video_partial"])', source)
+
+
 class OrderingRegressionTests(unittest.TestCase):
     def test_supervisor_starts_heartbeat_before_pid_resolution(self):
         source = inspect.getsource(supervisor.main)

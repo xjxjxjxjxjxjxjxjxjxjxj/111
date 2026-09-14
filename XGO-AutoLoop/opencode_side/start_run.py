@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import subprocess
 import sys
 import time
@@ -83,7 +84,9 @@ def main() -> int:
     sftp = client.open_sftp()
     uploaded = deploy_project(client, sftp, request["current_project"], project, backup, tmp)
     ensure_remote_dir(sftp, runtime_dir)
-    ensure_remote_dir(sftp, str(Path(request["remote_video_partial"]).parent))
+    # Remote paths are POSIX.  Building their parent with pathlib.Path on Windows
+    # rewrites separators to backslashes and mkdir then targets "/\home\...".
+    ensure_remote_dir(sftp, posixpath.dirname(request["remote_video_partial"]))
     sftp.close()
     print("DEPLOYED %d files to %s" % (uploaded, project))
 
