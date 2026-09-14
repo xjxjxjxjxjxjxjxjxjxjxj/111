@@ -1,5 +1,5 @@
 {
-  "version": "dog18_closed_loop",
+  "version": "dog19_closed_loop",
   "is_current_latest": true,
   "based_on": "D:/Desktop/dog10 and senior fin.py motion helpers",
   "rule_sign_mode": "one random yellow-or-black sign per side",

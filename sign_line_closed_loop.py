@@ -52,6 +52,32 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def limit_reacquire_command(
+    error: float,
+    follower_forward: float,
+    follower_turn: float,
+    action_cfg: Dict[str, Any],
+) -> Tuple[float, float]:
+    """Bound the yellow reacquire command so the dog aligns instead of spinning.
+
+    A far-off guide line previously saturated the turn term (up to the 48 deg/s
+    cap) while still creeping forward, so the dog circled in place and never
+    reacquired the line (field report 2026-09-14 dog18: 原地/小幅打转).  When the
+    error is large the command now holds position and turns in place with a
+    capped yaw; once roughly aligned it resumes a bounded forward follow. 偏离较大
+    时限幅原地转向对齐，避免满舵打转。
+    """
+
+    align_error = float(action_cfg.get("yellow_align_error", 0.35))
+    max_seek_turn = float(action_cfg.get("yellow_reacquire_max_turn", 20.0))
+    forward = min(follower_forward, float(action_cfg["yellow_reacquire_speed"]))
+    turn = follower_turn
+    if abs(error) > align_error:
+        forward = 0.0
+        turn = clamp(turn, -max_seek_turn, max_seek_turn)
+    return forward, turn
+
+
 @dataclass(frozen=True)
 class Detection:
     label: str
@@ -1132,6 +1158,7 @@ def run(args: argparse.Namespace) -> int:
     yellow_recovery = False
     yellow_recovery_started = 0.0
     yellow_centered_frames = 0
+    yellow_last_error: Optional[float] = None
     target_loss_stopped = False
 
     # --- OpenCode supervisor integration -------------------------------------
@@ -1257,10 +1284,19 @@ def run(args: argparse.Namespace) -> int:
                     run_outcome = "yellow_reacquire_timeout"
                     break
 
+                max_seek_turn = float(recovery_cfg.get("yellow_reacquire_max_turn", 20.0))
                 if analysis.line_error is None:
+                    # The guide line is out of view.  Rotate slowly toward the
+                    # last known side to search instead of sitting still. 线不在
+                    # 视野内时朝上次方向缓慢转向搜索。
                     yellow_centered_frames = 0
-                    robot.stop()
+                    if yellow_last_error is None:
+                        robot.stop()
+                    else:
+                        _, seek_turn = follower.command(yellow_last_error, now)
+                        robot.follow(0.0, clamp(seek_turn, -max_seek_turn, max_seek_turn))
                 else:
+                    yellow_last_error = analysis.line_error
                     if abs(analysis.line_error) <= float(
                         recovery_cfg["yellow_center_error_max"]
                     ):
@@ -1279,9 +1315,14 @@ def run(args: argparse.Namespace) -> int:
                         run_outcome = "goal_complete_yellow"
                         break
 
-                    forward, turn = follower.command(analysis.line_error, now)
-                    forward = min(
-                        forward, float(recovery_cfg["yellow_reacquire_speed"])
+                    follower_forward, follower_turn = follower.command(
+                        analysis.line_error, now
+                    )
+                    forward, turn = limit_reacquire_command(
+                        analysis.line_error,
+                        follower_forward,
+                        follower_turn,
+                        recovery_cfg,
                     )
                     robot.follow(forward, turn)
             else:

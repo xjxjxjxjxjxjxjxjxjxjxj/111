@@ -31,6 +31,7 @@ from sign_line_closed_loop import (
     VisionProcessor,
     XGORobot,
     build_parser,
+    limit_reacquire_command,
     load_config,
 )
 
@@ -462,6 +463,31 @@ class YellowBypassTests(unittest.TestCase):
         lateral_calls = [c for c in calls if c == ("y", -10.0)]
         self.assertGreaterEqual(len(lateral_calls), 20)
         self.assertEqual(calls[-1], ("stop",))
+
+
+class YellowReacquireTests(unittest.TestCase):
+    """A far-off guide line must align in place, not spin with a saturated turn."""
+
+    def action_cfg(self):
+        return {
+            "yellow_reacquire_speed": 6,
+            "yellow_reacquire_max_turn": 20,
+            "yellow_align_error": 0.35,
+        }
+
+    def test_misaligned_line_holds_position_and_caps_turn(self):
+        forward, turn = limit_reacquire_command(-1.0, 6.0, 48.0, self.action_cfg())
+        self.assertEqual(forward, 0.0)
+        self.assertEqual(turn, 20.0)
+
+    def test_aligned_line_keeps_bounded_forward_follow(self):
+        forward, turn = limit_reacquire_command(0.05, 6.0, 4.0, self.action_cfg())
+        self.assertEqual(forward, 6.0)
+        self.assertEqual(turn, 4.0)
+
+    def test_forward_is_capped_by_reacquire_speed(self):
+        forward, _ = limit_reacquire_command(0.05, 12.0, 4.0, self.action_cfg())
+        self.assertEqual(forward, 6.0)
 
 
 if __name__ == "__main__":
