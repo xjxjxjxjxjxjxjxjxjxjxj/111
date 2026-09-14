@@ -31,7 +31,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Dict, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -776,13 +776,63 @@ class PIDLineFollower:
         return speed, turn
 
 
+class BypassPlan:
+    """Replay the yellow-sign detour every control frame instead of once.
+
+    The XGO firmware only advances a few steps per ``move`` packet.  The former
+    blocking ``_timed_move`` sent one packet and slept, so the dog stopped after
+    a few steps and never cleared the sign (field report 2026-09-14: "有横移但
+    没绕过去").  This plan keeps the same three phases (lateral out, forward
+    past, lateral back) but is polled per frame so the command is re-issued and
+    the per-frame stop/heartbeat safety checks keep running. 每个控制帧重发移动
+    指令，避免走几步就停下，同时让停止/心跳检查继续生效。
+    """
+
+    def __init__(self, action_cfg: Dict[str, Any]) -> None:
+        direction = str(action_cfg["bypass_direction"]).lower()
+        sign = 1.0 if direction == "left" else -1.0
+        lateral_speed = sign * float(action_cfg["bypass_lateral_speed"])
+        self.phases: List[Tuple[str, float, float]] = [
+            ("y", lateral_speed, float(action_cfg["bypass_lateral_s"])),
+            (
+                "x",
+                float(action_cfg["bypass_forward_speed"]),
+                float(action_cfg["bypass_forward_s"]),
+            ),
+            ("y", -lateral_speed, float(action_cfg["bypass_return_s"])),
+        ]
+        self.index = 0
+        self.phase_start: Optional[float] = None
+
+    @property
+    def finished(self) -> bool:
+        return self.index >= len(self.phases)
+
+    def command(self, now: float) -> Optional[Tuple[str, float]]:
+        """Return the current (axis, speed), advancing phases as time elapses."""
+        if self.finished:
+            return None
+        if self.phase_start is None:
+            self.phase_start = now
+        axis, speed, duration = self.phases[self.index]
+        while now - self.phase_start >= duration:
+            self.index += 1
+            self.phase_start += duration
+            if self.finished:
+                return None
+            axis, speed, duration = self.phases[self.index]
+        return axis, speed
+
+
 class NullRobot:
     """Observe-mode robot: log commands without touching hardware."""
 
     def __init__(self, config: Dict[str, Any]) -> None:
-        self.last_command: Optional[Tuple[float, float]] = None
+        self.action_cfg = config["actions"]
+        self.last_command: Optional[Tuple[Any, ...]] = None
         self.arm_wave_deadline: Optional[float] = None
         self.arm_wave_s = float(config["actions"]["arm_wave_s"])
+        self.bypass_plan: Optional[BypassPlan] = None
 
     def follow(self, forward: float, turn: float) -> None:
         self.last_command = (forward, turn)
@@ -793,8 +843,19 @@ class NullRobot:
     def alarm(self) -> None:
         print("[observe] ALARM")
 
-    def bypass(self) -> None:
+    def start_bypass(self) -> None:
+        self.bypass_plan = BypassPlan(self.action_cfg)
         print("[observe] YELLOW -> bypass")
+
+    def update_bypass(self, now: float) -> bool:
+        assert self.bypass_plan is not None
+        command = self.bypass_plan.command(now)
+        if command is None:
+            self.bypass_plan = None
+            self.last_command = (0.0, 0.0)
+            return True
+        self.last_command = command
+        return False
 
     def begin_knock_down(self) -> None:
         self.arm_wave_deadline = time.monotonic() + self.arm_wave_s
@@ -826,12 +887,13 @@ class XGORobot:
         self.action_cfg = config["actions"]
         self.dog = XGO(model)
         self.edu = None
-        self.last_command: Optional[Tuple[int, int]] = None
+        self.last_command: Optional[Tuple[Any, ...]] = None
         self.last_write = 0.0
         self.min_write_interval = float(config["motion"]["command_interval_s"])
         self.arm_wave_deadline: Optional[float] = None
         self.next_arm_command = 0.0
         self.arm_wave_high = True
+        self.bypass_plan: Optional[BypassPlan] = None
         self.dog.pace(str(config["motion"]["pace"]))
         # 用户要求：每次启动后先收回机械臂，避免带着上次姿态出发。
         self.stow_arm()
@@ -876,12 +938,6 @@ class XGORobot:
         self.last_command = (0, 0)
         self.last_write = time.monotonic()
 
-    def _timed_move(self, axis: str, speed: float, seconds: float) -> None:
-        self.dog.move(axis, speed)
-        time.sleep(max(0.0, seconds))
-        self.stop()
-        time.sleep(float(self.action_cfg["motion_pause_s"]))
-
     def alarm(self) -> None:
         self.stop()
         time.sleep(float(self.action_cfg["motion_pause_s"]))
@@ -895,21 +951,30 @@ class XGORobot:
         print("\aALARM")
         time.sleep(float(self.action_cfg["motion_pause_s"]))
 
-    def bypass(self) -> None:
-        direction = str(self.action_cfg["bypass_direction"]).lower()
-        sign = 1.0 if direction == "left" else -1.0
-        lateral_speed = sign * float(self.action_cfg["bypass_lateral_speed"])
-        self._timed_move(
-            "y", lateral_speed, float(self.action_cfg["bypass_lateral_s"])
-        )
-        self._timed_move(
-            "x",
-            float(self.action_cfg["bypass_forward_speed"]),
-            float(self.action_cfg["bypass_forward_s"]),
-        )
-        self._timed_move(
-            "y", -lateral_speed, float(self.action_cfg["bypass_return_s"])
-        )
+    def start_bypass(self) -> None:
+        """Begin the non-blocking yellow detour; polled via update_bypass()."""
+        self.bypass_plan = BypassPlan(self.action_cfg)
+
+    def update_bypass(self, now: float) -> bool:
+        """Re-issue the current detour command each frame; return True when done.
+
+        The former implementation slept inside ``_timed_move`` after a single
+        ``move`` packet, so the firmware stopped the dog after a few steps and
+        the sign was never cleared.  Re-sending here mirrors ``follow`` and keeps
+        the per-frame stop/heartbeat checks alive. 每帧重发，走完全程才结束。
+        """
+        assert self.bypass_plan is not None
+        command = self.bypass_plan.command(now)
+        if command is None:
+            self.stop()
+            self.bypass_plan = None
+            return True
+        axis, speed = command
+        if command != self.last_command or now - self.last_write >= self.min_write_interval:
+            self.dog.move(axis, speed)
+            self.last_command = command
+            self.last_write = now
+        return False
 
     def begin_knock_down(self) -> None:
         """Start the non-blocking arm wave used for a black sign.
@@ -1063,6 +1128,7 @@ def run(args: argparse.Namespace) -> int:
     # keeps the visual line follower active while scheduling arm poses in this
     # same loop.  YELLOW_RECOVER ends only after stable line centering.
     black_advancing = False
+    yellow_bypassing = False
     yellow_recovery = False
     yellow_recovery_started = 0.0
     yellow_centered_frames = 0
@@ -1162,6 +1228,22 @@ def run(args: argparse.Namespace) -> int:
                         forward, float(config["actions"]["black_follow_speed"])
                     )
                     robot.follow(forward, turn)
+            elif yellow_bypassing:
+                # Non-blocking detour: the command is re-issued every frame so
+                # the dog actually travels the whole lateral/forward/return path
+                # (the old one-shot timed move stopped after a few steps). 逐帧
+                # 重发移动指令，走完绕行路径再进入找线恢复。
+                if robot.update_bypass(now):
+                    yellow_bypassing = False
+                    yellow_recovery = True
+                    yellow_recovery_started = now
+                    yellow_centered_frames = 0
+                    follower.reset()
+                    line_lost_since = None
+                    print(
+                        "YELLOW RECOVERY: bypass finished; looking for the guide "
+                        "line and waiting for stable centering."
+                    )
             elif yellow_recovery:
                 recovery_cfg = config["actions"]
                 recovery_age = now - yellow_recovery_started
@@ -1219,15 +1301,13 @@ def run(args: argparse.Namespace) -> int:
                     # selected only after distance and colour are both stable.
                     robot.alarm()
                     if triggered.label == "yellow":
-                        robot.bypass()
+                        robot.start_bypass()
                         follower.reset()
                         line_lost_since = None
-                        yellow_recovery = True
-                        yellow_recovery_started = time.monotonic()
-                        yellow_centered_frames = 0
+                        yellow_bypassing = True
                         print(
-                            "YELLOW RECOVERY: bypass finished; looking for the guide "
-                            "line and waiting for stable centering."
+                            "YELLOW BYPASS: alarm done; circling the sign, then "
+                            "reacquiring the guide line."
                         )
                     else:
                         robot.begin_knock_down()
@@ -1276,6 +1356,8 @@ def run(args: argparse.Namespace) -> int:
 
             if black_advancing:
                 controller_state = "black_advance"
+            elif yellow_bypassing:
+                controller_state = "yellow_bypass"
             elif yellow_recovery:
                 controller_state = "yellow_recovery"
             elif target_loss_stopped:

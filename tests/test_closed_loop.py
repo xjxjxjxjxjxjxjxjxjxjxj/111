@@ -24,10 +24,12 @@ from cup_vision import CupClosedLoopController, CupVision
 from image_io import read_image
 from course_memory import CourseMemory, CoursePhase
 from sign_line_closed_loop import (
+    BypassPlan,
     Detection,
     SignDistanceTracker,
     TargetLossSafetyLock,
     VisionProcessor,
+    XGORobot,
     build_parser,
     load_config,
 )
@@ -402,6 +404,64 @@ class SupervisorSafetyArgumentTests(unittest.TestCase):
         self.assertEqual(args.heartbeat, "/tmp/supervisor.heartbeat")
         self.assertEqual(args.heartbeat_timeout_s, 1.5)
         self.assertEqual(args.pid_file, "/tmp/run.pid")
+
+
+class YellowBypassTests(unittest.TestCase):
+    """The yellow detour must be re-issued per frame, not sent once.
+
+    Field report 2026-09-14: the dog strafed a little and stopped, so the sign
+    was never cleared.  Root cause was a single ``move`` packet followed by a
+    sleep; the firmware advances only a few steps per packet.
+    """
+
+    def action_cfg(self, direction="right"):
+        return {
+            "bypass_direction": direction,
+            "bypass_lateral_speed": 10,
+            "bypass_lateral_s": 3.0,
+            "bypass_forward_speed": 9,
+            "bypass_forward_s": 4.5,
+            "bypass_return_s": 3.0,
+        }
+
+    def test_plan_replays_three_phases_in_order(self):
+        plan = BypassPlan(self.action_cfg())
+        self.assertEqual(plan.command(0.0), ("y", -10.0))
+        self.assertEqual(plan.command(2.9), ("y", -10.0))
+        self.assertEqual(plan.command(3.1), ("x", 9.0))
+        self.assertEqual(plan.command(7.5), ("y", 10.0))
+        self.assertEqual(plan.command(10.7), None)
+        self.assertTrue(plan.finished)
+
+    def test_left_direction_mirrors_lateral_sign(self):
+        plan = BypassPlan(self.action_cfg("left"))
+        self.assertEqual(plan.command(0.0), ("y", 10.0))
+
+    def test_update_bypass_reissues_move_packet(self):
+        robot = object.__new__(XGORobot)
+        robot.action_cfg = self.action_cfg()
+        robot.min_write_interval = 0.08
+        robot.last_command = None
+        robot.last_write = -1.0
+
+        calls = []
+
+        class FakeDog:
+            def move(self, axis, speed):
+                calls.append((axis, speed))
+
+            def stop(self):
+                calls.append(("stop",))
+
+        robot.dog = FakeDog()
+        robot.start_bypass()
+        now = 0.0
+        while not robot.update_bypass(now):
+            now += 0.1
+            self.assertLess(now, 15.0, "bypass did not finish")
+        lateral_calls = [c for c in calls if c == ("y", -10.0)]
+        self.assertGreaterEqual(len(lateral_calls), 20)
+        self.assertEqual(calls[-1], ("stop",))
 
 
 if __name__ == "__main__":
