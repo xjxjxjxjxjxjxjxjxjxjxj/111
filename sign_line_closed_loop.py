@@ -133,7 +133,15 @@ class VisionProcessor:
         # 只有窄的竖直暗色段才算引导线，避免大面积暗块被判成线或把线粘连丢掉。
         band_h = int(self.line_cfg.get("scan_band_px", 18))
         band_h = max(4, min(height, band_h))
-        dark_fraction = (mask[height - band_h:height, :] > 0).mean(axis=0)
+        # Sample a band in the MID-LOWER part of the ROI, not the very bottom:
+        # the camera sits close to the floor, so the guide line is extremely wide
+        # in the near field (bottom edge) and merges with the floor there, while a
+        # little higher it is a clean narrow run. 采样带取 ROI 中下部，避开近场
+        # 过宽并已与地面粘连的线，避免误判丢线。
+        center_ratio = float(self.line_cfg.get("scan_band_offset_ratio", 0.66))
+        center_row = int(clamp(center_ratio, 0.0, 1.0) * height)
+        band_top = max(0, min(height - band_h, center_row - band_h // 2))
+        dark_fraction = (mask[band_top:band_top + band_h, :] > 0).mean(axis=0)
         dark_threshold = float(self.line_cfg.get("scan_col_dark", 0.55))
         min_width = int(self.line_cfg.get("scan_min_width_px", 4))
         max_width = int(float(self.line_cfg.get("scan_max_width_ratio", 0.22)) * width)

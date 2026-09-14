@@ -9,6 +9,7 @@
     "gray_max": 80,
     "min_area_px": 90,
     "scan_band_px": 18,
+    "scan_band_offset_ratio": 0.66,
     "scan_col_dark": 0.55,
     "scan_min_width_px": 4,
     "scan_max_width_ratio": 0.22,

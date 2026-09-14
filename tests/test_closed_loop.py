@@ -107,6 +107,20 @@ class LineFollowingRegressionTests(unittest.TestCase):
         self.assertIsNotNone(analysis.line_error)
         self.assertAlmostEqual(analysis.line_error, 0.0, delta=0.06)
 
+    def test_wide_near_field_floor_does_not_hide_the_guide_line(self):
+        # dog16 evidence: the camera is close to the floor, so the guide line is
+        # very wide in the near field and merges with the floor at the bottom
+        # edge; a bottom-edge scan then reported line loss.  The mid-lower scan
+        # band must still isolate the narrow guide line.
+        frame = np.full((240, 320, 3), 220, dtype=np.uint8)
+        cv2.rectangle(frame, (164, 134), (182, 239), (15, 15, 15), -1)  # guide line
+        cv2.rectangle(frame, (0, 222), (319, 239), (15, 15, 15), -1)  # near-field floor
+
+        analysis = self.vision.analyze(frame)
+
+        self.assertIsNotNone(analysis.line_error)
+        self.assertAlmostEqual(analysis.line_error, 0.0, delta=0.06)
+
 
 class SignDistanceLoopTests(unittest.TestCase):
     @classmethod
