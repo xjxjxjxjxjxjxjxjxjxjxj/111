@@ -808,6 +808,8 @@ class XGORobot:
         self.next_arm_command = 0.0
         self.arm_wave_high = True
         self.dog.pace(str(config["motion"]["pace"]))
+        # 用户要求：每次启动后先收回机械臂，避免带着上次姿态出发。
+        self.stow_arm()
 
         try:
             try:
@@ -817,6 +819,20 @@ class XGORobot:
             self.edu = XGOEDU()
         except Exception as exc:
             print(f"[warning] XGOEDU unavailable; alarm will use terminal bell: {exc}")
+
+    def stow_arm(self) -> None:
+        """Bring the arm back to its stowed/initial pose.
+
+        用户要求：启动后、抓球后、投放后都要收回机械臂。获准入口在启动与收尾
+        调用本方法；完整自主程序执行抓球/投放后也应调用同一个方法。
+        """
+        try:
+            self.dog.arm(
+                float(self.action_cfg["arm_stow_x"]),
+                float(self.action_cfg["arm_stow_z"]),
+            )
+        except Exception as exc:  # pragma: no cover - hardware dependent
+            print(f"[warning] arm stow failed: {exc}")
 
     def follow(self, forward: float, turn: float) -> None:
         now = time.monotonic()
@@ -888,10 +904,7 @@ class XGORobot:
         if self.arm_wave_deadline is None:
             raise RuntimeError("Arm wave was not started")
         if now >= self.arm_wave_deadline:
-            self.dog.arm(
-                float(self.action_cfg["arm_stow_x"]),
-                float(self.action_cfg["arm_stow_z"]),
-            )
+            self.stow_arm()
             self.arm_wave_deadline = None
             return True
 
@@ -910,10 +923,7 @@ class XGORobot:
     def close(self) -> None:
         try:
             self.stop()
-            self.dog.arm(
-                float(self.action_cfg["arm_stow_x"]),
-                float(self.action_cfg["arm_stow_z"]),
-            )
+            self.stow_arm()
         except Exception as exc:
             print(f"[warning] shutdown command failed: {exc}")
 
@@ -975,6 +985,16 @@ def describe(
 
 
 def run(args: argparse.Namespace) -> int:
+    # Publish the real Python PID before camera/hardware initialization.  The
+    # supervisor can now bind this exact run even when opening the camera fails
+    # or takes unusually long.
+    start = time.monotonic()
+    if args.pid_file:
+        pid_path = Path(args.pid_file)
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(os.getpid()), encoding="ascii")
+        print(f"PID {os.getpid()} written to {pid_path}")
+
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
     geometry_path = config_path.parent / str(
@@ -1009,7 +1029,6 @@ def run(args: argparse.Namespace) -> int:
         args.record_fps,
         (int(config["camera"]["width"]), int(config["camera"]["height"])),
     )
-    start = time.monotonic()
     last_print = 0.0
     line_lost_since: Optional[float] = None
     exit_code = 0
@@ -1023,6 +1042,15 @@ def run(args: argparse.Namespace) -> int:
     yellow_recovery_started = 0.0
     yellow_centered_frames = 0
     target_loss_stopped = False
+
+    # --- OpenCode supervisor integration -------------------------------------
+    # The launch side seeds the run-specific heartbeat and the supervisor starts
+    # refreshing it before PID resolution.  Do not add start_delay here: after a
+    # motor start delay, the very first control frame must verify a fresh
+    # heartbeat instead of granting extra unmonitored driving time.
+    heartbeat_grace_s = max(
+        3.0, max(0.0, float(args.heartbeat_timeout_s)) + 1.0
+    )
 
     if args.mode == "run" and args.start_delay > 0:
         print(f"Motors enabled in {args.start_delay:.1f} s. Press Ctrl+C to abort.")
@@ -1040,6 +1068,33 @@ def run(args: argparse.Namespace) -> int:
     )
     try:
         while args.max_seconds <= 0 or time.monotonic() - start < args.max_seconds:
+            # Per-frame safety checks.  They MUST run on every control frame (not
+            # only at some boundary) so an OpenCode "停止" stops the motors on the
+            # very next frame.  They run before any motor command is issued.
+            if args.stop_request and os.path.exists(args.stop_request):
+                robot.stop()
+                exit_code = 0
+                run_outcome = "opencode_stop"
+                print("STOP REQUESTED: stop.request detected; robot stopped safely.")
+                break
+            if args.heartbeat and float(args.heartbeat_timeout_s) > 0:
+                if time.monotonic() - start >= heartbeat_grace_s:
+                    try:
+                        heartbeat_age = time.time() - os.path.getmtime(args.heartbeat)
+                    except OSError:
+                        heartbeat_age = None
+                    if heartbeat_age is None or heartbeat_age > float(
+                        args.heartbeat_timeout_s
+                    ):
+                        robot.stop()
+                        exit_code = 3
+                        run_outcome = "supervisor_heartbeat_lost"
+                        print(
+                            "SAFETY STOP: supervisor heartbeat missing or stale; "
+                            "robot stopped."
+                        )
+                        break
+
             ok, frame = camera.read()
             if not ok or frame is None:
                 robot.stop()
@@ -1299,6 +1354,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional JSONL path; defaults beside --record-video",
     )
     parser.add_argument("--record-fps", type=float, default=20.0)
+    # OpenCode supervisor integration.  These are optional so offline tests and
+    # observe runs are unaffected; when supplied they give OpenCode a way to
+    # stop the loop immediately and a way to detect a dead supervisor.
+    parser.add_argument(
+        "--stop-request",
+        default="",
+        help="stop.flag path checked on every control frame; its presence means stop",
+    )
+    parser.add_argument(
+        "--heartbeat",
+        default="",
+        help="local-supervisor heartbeat file; if its mtime is stale the robot stops",
+    )
+    parser.add_argument(
+        "--heartbeat-timeout-s",
+        type=float,
+        default=2.0,
+        help="seconds without a refreshed heartbeat before the safety stop fires",
+    )
+    parser.add_argument(
+        "--pid-file",
+        default="",
+        help="write this process PID here so OpenCode can escalate to SIGINT",
+    )
     return parser
 
 

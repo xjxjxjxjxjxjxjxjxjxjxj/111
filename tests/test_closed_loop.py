@@ -28,6 +28,7 @@ from sign_line_closed_loop import (
     SignDistanceTracker,
     TargetLossSafetyLock,
     VisionProcessor,
+    build_parser,
     load_config,
 )
 
@@ -319,6 +320,31 @@ class CourseMemoryTests(unittest.TestCase):
         memory.phase = CoursePhase.OUTBOUND_LINE
         with self.assertRaises(RuntimeError):
             memory.begin_sign("yellow", stable_distance=True)
+
+
+class SupervisorSafetyArgumentTests(unittest.TestCase):
+    """The per-frame stop/heartbeat options must stay wired into the CLI."""
+
+    def test_supervisor_safety_arguments_have_safe_defaults(self):
+        args = build_parser().parse_args([])
+        self.assertEqual(args.stop_request, "")
+        self.assertEqual(args.heartbeat, "")
+        self.assertEqual(args.pid_file, "")
+        self.assertEqual(args.heartbeat_timeout_s, 2.0)
+
+    def test_supervisor_safety_arguments_are_accepted(self):
+        args = build_parser().parse_args(
+            [
+                "--stop-request", "/tmp/run.stop.request",
+                "--heartbeat", "/tmp/supervisor.heartbeat",
+                "--heartbeat-timeout-s", "1.5",
+                "--pid-file", "/tmp/run.pid",
+            ]
+        )
+        self.assertEqual(args.stop_request, "/tmp/run.stop.request")
+        self.assertEqual(args.heartbeat, "/tmp/supervisor.heartbeat")
+        self.assertEqual(args.heartbeat_timeout_s, 1.5)
+        self.assertEqual(args.pid_file, "/tmp/run.pid")
 
 
 if __name__ == "__main__":

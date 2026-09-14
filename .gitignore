@@ -24,3 +24,12 @@ Thumbs.db
 Desktop.ini
 .vscode/
 .idea/
+
+# Keep runtime data private, but version the OpenCode execution layer so fixes
+# to the supervisor/stop channel do not exist only in one ignored local folder.
+!XGO-AutoLoop/
+XGO-AutoLoop/*
+!XGO-AutoLoop/opencode_side/
+!XGO-AutoLoop/opencode_side/*.py
+!XGO-AutoLoop/opencode_side/tests/
+!XGO-AutoLoop/opencode_side/tests/*.py
