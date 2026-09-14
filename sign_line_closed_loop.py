@@ -71,11 +71,67 @@ def limit_reacquire_command(
     align_error = float(action_cfg.get("yellow_align_error", 0.35))
     max_seek_turn = float(action_cfg.get("yellow_reacquire_max_turn", 20.0))
     forward = min(follower_forward, float(action_cfg["yellow_reacquire_speed"]))
-    turn = follower_turn
+    # The recovery ceiling applies in both alignment and forward-follow modes.
+    # Otherwise one derivative spike just inside ``yellow_align_error`` can
+    # still send the original 48-degree command. 回线全过程限制转向峰值。
+    turn = clamp(follower_turn, -max_seek_turn, max_seek_turn)
     if abs(error) > align_error:
         forward = 0.0
-        turn = clamp(turn, -max_seek_turn, max_seek_turn)
+        # Use a bounded proportional alignment command rather than the normal
+        # PID derivative while stationary. This removes sign-flipping spikes
+        # when the detector changes segments. 原地对齐不用巡线微分项。
+        align_kp = float(action_cfg.get("yellow_align_kp", 24.0))
+        turn = clamp(-align_kp * error, -max_seek_turn, max_seek_turn)
     return forward, turn
+
+
+def reacquire_search_turn(
+    last_error: Optional[float], action_cfg: Dict[str, Any]
+) -> float:
+    """Return a slow deterministic yaw while the guide line is not visible.
+
+    A non-zero last error supplies the search side. If the line was centered
+    before the open-loop detour, its expected side follows the configured
+    bypass direction (a right bypass leaves the guide to the left). This avoids
+    the old zero-error deadlock without adding forward motion. 丢线时只低速转向
+    搜索；绕行前误差接近零时按绕行方向推断搜索侧，绝不盲目前进。
+    """
+
+    max_turn = abs(float(action_cfg.get("yellow_reacquire_max_turn", 20.0)))
+    search_turn = min(
+        max_turn, abs(float(action_cfg.get("yellow_search_turn", 10.0)))
+    )
+    direction_deadband = abs(
+        float(action_cfg.get("yellow_search_error_deadband", 0.05))
+    )
+    if last_error is not None and abs(last_error) > direction_deadband:
+        return math.copysign(search_turn, -last_error)
+    bypass_direction = str(action_cfg.get("bypass_direction", "right")).lower()
+    return search_turn if bypass_direction == "right" else -search_turn
+
+
+def gate_initial_reacquire_error(
+    error: Optional[float],
+    already_acquired: bool,
+    action_cfg: Dict[str, Any],
+) -> Tuple[Optional[float], bool]:
+    """Reject far-edge markings until a plausible guide-line lock is acquired.
+
+    dog18 first saw the circular boundary at error ~= -1.0 after its fixed
+    bypass. Treating that boundary as the guide immediately caused a saturated
+    turn. Before the first plausible lock, only a line within the configured
+    acquisition window may steer the dog; after lock, temporal tracking governs
+    continuity. 首次回线前拒绝画面边缘圆弧，避免把赛区圆环当成引导直线。
+    """
+
+    if error is None:
+        return None, already_acquired
+    if already_acquired:
+        return error, True
+    maximum = float(action_cfg.get("yellow_acquire_error_max", 0.65))
+    if abs(error) > maximum:
+        return None, False
+    return error, True
 
 
 @dataclass(frozen=True)
@@ -103,6 +159,45 @@ class VisionProcessor:
         self.camera_cfg = config["camera"]
         self.line_cfg = config["line"]
         self.sign_cfg = config["sign"]
+        # Temporal anchor used only to choose between current-frame candidates.
+        # It never turns a missing line into a detection, so the existing
+        # line-lost safety stop remains authoritative. 跨帧锚点只用于候选消歧，
+        # 丢线帧仍返回 None，绝不绕过丢线停车安全锁。
+        self._last_line_center: Optional[float] = None
+        self._filtered_line_center: Optional[float] = None
+        self._line_tracking_misses = 0
+
+    def reset_line_tracking(self) -> None:
+        """Forget line history at a deliberate manoeuvre boundary / 动作切换清空历史。"""
+
+        self._last_line_center = None
+        self._filtered_line_center = None
+        self._line_tracking_misses = 0
+
+    @staticmethod
+    def _narrow_runs(
+        dark_fraction: np.ndarray,
+        dark_threshold: float,
+        min_width: int,
+        max_width: int,
+    ) -> List[Tuple[int, int]]:
+        """Return contiguous narrow dark runs from one horizontal scan band."""
+
+        runs: List[Tuple[int, int]] = []
+        run_start: Optional[int] = None
+        for column, fraction in enumerate(dark_fraction):
+            if fraction >= dark_threshold and run_start is None:
+                run_start = column
+            elif fraction < dark_threshold and run_start is not None:
+                runs.append((run_start, column - 1))
+                run_start = None
+        if run_start is not None:
+            runs.append((run_start, len(dark_fraction) - 1))
+        return [
+            (start, end)
+            for start, end in runs
+            if min_width <= (end - start + 1) <= max_width
+        ]
 
     @staticmethod
     def _roi_rect(
@@ -149,58 +244,147 @@ class VisionProcessor:
 
         roi_area = float(mask.shape[0] * mask.shape[1])
         height, width = mask.shape[:2]
-        # dog15 field evidence: segmenting the whole ROI let a floor shadow or a
-        # nearby dark object merge with the 20 mm guide line, and the merged blob
-        # then failed the narrow-line geometry so the line was reported lost on
-        # most frames (robot stopped).  The guide line is whatever passes under
-        # the robot, so locate it in a thin BOTTOM band using a per-column dark
-        # profile and require a narrow run.  Wide merged regions are rejected and
-        # fall through to the existing line-lost safety stop. 底部窄带列剖面：
-        # 只有窄的竖直暗色段才算引导线，避免大面积暗块被判成线或把线粘连丢掉。
+        # dog15/dog18 evidence: whole-ROI blobs merged the guide with shadows,
+        # while a single horizontal scan could jump between the straight guide
+        # and the circular field marking. Sample several mid/lower bands, require
+        # agreement, then prefer the track continuous with the previous frame.
+        # 多采样带投票并结合上一帧位置选段，避免在直线、圆弧和阴影间跳变。
         band_h = int(self.line_cfg.get("scan_band_px", 18))
         band_h = max(4, min(height, band_h))
-        # Sample a band in the MID-LOWER part of the ROI, not the very bottom:
-        # the camera sits close to the floor, so the guide line is extremely wide
-        # in the near field (bottom edge) and merges with the floor there, while a
-        # little higher it is a clean narrow run. 采样带取 ROI 中下部，避开近场
-        # 过宽并已与地面粘连的线，避免误判丢线。
         center_ratio = float(self.line_cfg.get("scan_band_offset_ratio", 0.66))
-        center_row = int(clamp(center_ratio, 0.0, 1.0) * height)
-        band_top = max(0, min(height - band_h, center_row - band_h // 2))
-        dark_fraction = (mask[band_top:band_top + band_h, :] > 0).mean(axis=0)
+        configured_offsets = self.line_cfg.get(
+            "scan_band_offsets_ratio", [center_ratio]
+        )
+        offsets = sorted(
+            {
+                float(clamp(float(value), 0.0, 1.0))
+                for value in configured_offsets
+            }
+        )
+        if not offsets:
+            offsets = [center_ratio]
         dark_threshold = float(self.line_cfg.get("scan_col_dark", 0.55))
         min_width = int(self.line_cfg.get("scan_min_width_px", 4))
         max_width = int(float(self.line_cfg.get("scan_max_width_ratio", 0.22)) * width)
         max_width = max(min_width + 1, max_width)
+        runs_by_band: List[List[Tuple[int, int]]] = []
+        for offset in offsets:
+            center_row = int(offset * height)
+            band_top = max(0, min(height - band_h, center_row - band_h // 2))
+            dark_fraction = (mask[band_top : band_top + band_h, :] > 0).mean(axis=0)
+            runs_by_band.append(
+                self._narrow_runs(
+                    dark_fraction, dark_threshold, min_width, max_width
+                )
+            )
 
-        runs = []
-        run_start = None
-        for column in range(width):
-            if dark_fraction[column] >= dark_threshold and run_start is None:
-                run_start = column
-            elif dark_fraction[column] < dark_threshold and run_start is not None:
-                runs.append((run_start, column - 1))
-                run_start = None
-        if run_start is not None:
-            runs.append((run_start, width - 1))
+        min_votes = max(
+            1,
+            min(
+                len(offsets),
+                int(self.line_cfg.get("scan_min_band_votes", 1)),
+            ),
+        )
+        max_band_shift = float(
+            self.line_cfg.get("scan_max_band_shift_ratio", 0.16)
+        ) * width
+        max_frame_jump = float(
+            self.line_cfg.get("scan_max_frame_jump_ratio", 0.24)
+        ) * width
+        target_offset = float(self.line_cfg.get("line_target_offset", 0.0))
+        target_center = width / 2.0 * (1.0 + target_offset)
 
-        valid = [
-            (start, end)
-            for start, end in runs
-            if min_width <= (end - start + 1) <= max_width
-        ]
-        if not valid:
+        tracks: List[Tuple[int, float, float, float, float]] = []
+        for anchor_band, runs in enumerate(runs_by_band):
+            for start, end in runs:
+                anchor_center = (start + end) / 2.0
+                members: List[Tuple[int, float, int]] = [
+                    (anchor_band, anchor_center, end - start + 1)
+                ]
+                for other_band, other_runs in enumerate(runs_by_band):
+                    if other_band == anchor_band or not other_runs:
+                        continue
+                    nearest = min(
+                        other_runs,
+                        key=lambda run: abs((run[0] + run[1]) / 2.0 - anchor_center),
+                    )
+                    other_center = (nearest[0] + nearest[1]) / 2.0
+                    if abs(other_center - anchor_center) <= max_band_shift:
+                        members.append(
+                            (other_band, other_center, nearest[1] - nearest[0] + 1)
+                        )
+                if len(members) < min_votes:
+                    continue
+                # The median represents the cross-band track without letting
+                # one circular-arc intersection own the steering point.
+                # 中位数融合多带中心，单个圆弧交点不能主导转向。
+                raw_center = float(np.median([value for _, value, _ in members]))
+                run_width = float(np.median([value for _, _, value in members]))
+                spread = max(value for _, value, _ in members) - min(
+                    value for _, value, _ in members
+                )
+                temporal_distance = (
+                    abs(raw_center - self._last_line_center)
+                    if self._last_line_center is not None
+                    else abs(raw_center - target_center)
+                )
+                if (
+                    self._last_line_center is not None
+                    and temporal_distance > max_frame_jump
+                ):
+                    continue
+                tracks.append(
+                    (
+                        len(members),
+                        temporal_distance,
+                        spread,
+                        raw_center,
+                        run_width,
+                    )
+                )
+
+        if not tracks:
+            self._line_tracking_misses += 1
+            if self._line_tracking_misses >= int(
+                self.line_cfg.get("line_memory_miss_frames", 5)
+            ):
+                self._last_line_center = None
+                self._filtered_line_center = None
             return None, 0.0, mask, (x1, y1, x2, y2)
 
-        # Prefer the run closest to the image centre; normally the guide line is
-        # the only narrow bottom run.
-        start, end = min(
-            valid, key=lambda run: abs((run[0] + run[1]) / 2.0 - width / 2.0)
+        # Balance band votes against temporal distance. Pure "most votes wins"
+        # switched dog16 from its guide to a five-band border fragment; pure
+        # nearest-neighbour tracking can latch onto noise. The weighted score
+        # preserves both evidence sources. 投票数与跨帧连续性共同打分。
+        continuity_scale = max(
+            1.0,
+            float(self.line_cfg.get("scan_continuity_scale_ratio", 0.10)) * width,
         )
-        cx = (start + end) / 2.0
-        target_offset = float(self.line_cfg.get("line_target_offset", 0.0))
+        votes, _, _, raw_center, run_width = max(
+            tracks,
+            key=lambda item: (
+                item[0]
+                - item[1] / continuity_scale
+                - item[2] / (2.0 * width),
+                -item[1],
+                -item[2],
+            ),
+        )
+        del votes
+        alpha = float(
+            clamp(float(self.line_cfg.get("line_error_ema_alpha", 0.60)), 0.0, 1.0)
+        )
+        cx = raw_center
+        if self._filtered_line_center is not None:
+            cx = alpha * raw_center + (1.0 - alpha) * self._filtered_line_center
+        # Candidate continuity follows the raw observation; the separate EMA
+        # only damps the command. A lagging EMA must not reject a real moving
+        # guide on the next frame. 原始中心负责建轨，平滑中心只负责控制。
+        self._last_line_center = raw_center
+        self._filtered_line_center = cx
+        self._line_tracking_misses = 0
         normalized_error = (cx - width / 2.0) / (width / 2.0) - target_offset
-        coverage = ((end - start + 1) * band_h) / roi_area
+        coverage = (run_width * band_h) / roi_area
         return (
             float(clamp(normalized_error, -1.0, 1.0)),
             float(coverage),
@@ -1159,6 +1343,7 @@ def run(args: argparse.Namespace) -> int:
     yellow_recovery_started = 0.0
     yellow_centered_frames = 0
     yellow_last_error: Optional[float] = None
+    yellow_line_acquired = False
     target_loss_stopped = False
 
     # --- OpenCode supervisor integration -------------------------------------
@@ -1256,6 +1441,11 @@ def run(args: argparse.Namespace) -> int:
                     )
                     robot.follow(forward, turn)
             elif yellow_bypassing:
+                # The fixed detour deliberately moves away from the tracked
+                # line. Do not let circular markings seen during that manoeuvre
+                # become the temporal anchor for recovery. 绕行阶段每帧清空跟踪
+                # 历史，防止圆弧被带入回线状态。
+                vision.reset_line_tracking()
                 # Non-blocking detour: the command is re-issued every frame so
                 # the dog actually travels the whole lateral/forward/return path
                 # (the old one-shot timed move stopped after a few steps). 逐帧
@@ -1284,20 +1474,29 @@ def run(args: argparse.Namespace) -> int:
                     run_outcome = "yellow_reacquire_timeout"
                     break
 
+                recovery_error, yellow_line_acquired = gate_initial_reacquire_error(
+                    analysis.line_error, yellow_line_acquired, recovery_cfg
+                )
+                if analysis.line_error is not None and recovery_error is None:
+                    # The far-edge candidate failed the initial gate. Forget it
+                    # immediately so it cannot become the next-frame anchor.
+                    # 未通过首次锁定门限的边缘候选不得写入跨帧记忆。
+                    vision.reset_line_tracking()
                 max_seek_turn = float(recovery_cfg.get("yellow_reacquire_max_turn", 20.0))
-                if analysis.line_error is None:
+                if recovery_error is None:
                     # The guide line is out of view.  Rotate slowly toward the
                     # last known side to search instead of sitting still. 线不在
                     # 视野内时朝上次方向缓慢转向搜索。
                     yellow_centered_frames = 0
-                    if yellow_last_error is None:
-                        robot.stop()
-                    else:
-                        _, seek_turn = follower.command(yellow_last_error, now)
-                        robot.follow(0.0, clamp(seek_turn, -max_seek_turn, max_seek_turn))
+                    seek_turn = reacquire_search_turn(
+                        yellow_last_error, recovery_cfg
+                    )
+                    robot.follow(
+                        0.0, clamp(seek_turn, -max_seek_turn, max_seek_turn)
+                    )
                 else:
-                    yellow_last_error = analysis.line_error
-                    if abs(analysis.line_error) <= float(
+                    yellow_last_error = recovery_error
+                    if abs(recovery_error) <= float(
                         recovery_cfg["yellow_center_error_max"]
                     ):
                         yellow_centered_frames += 1
@@ -1316,10 +1515,10 @@ def run(args: argparse.Namespace) -> int:
                         break
 
                     follower_forward, follower_turn = follower.command(
-                        analysis.line_error, now
+                        recovery_error, now
                     )
                     forward, turn = limit_reacquire_command(
-                        analysis.line_error,
+                        recovery_error,
                         follower_forward,
                         follower_turn,
                         recovery_cfg,
@@ -1342,6 +1541,12 @@ def run(args: argparse.Namespace) -> int:
                     # selected only after distance and colour are both stable.
                     robot.alarm()
                     if triggered.label == "yellow":
+                        # Preserve the last trustworthy guide side before the
+                        # open-loop detour. It supplies a bounded search direction
+                        # if the returned line is initially out of view. 绕行前保存
+                        # 可信方向，回线丢失时只按该方向低速搜索。
+                        yellow_last_error = analysis.line_error
+                        yellow_line_acquired = False
                         robot.start_bypass()
                         follower.reset()
                         line_lost_since = None
@@ -1423,6 +1628,7 @@ def run(args: argparse.Namespace) -> int:
                     "sign_distance_cm": measured_distance,
                     "robot_command": getattr(robot, "last_command", None),
                     "target_loss_lock_engaged": target_loss_lock.engaged,
+                    "yellow_line_acquired": yellow_line_acquired,
                 }
             )
 

@@ -31,8 +31,10 @@ from sign_line_closed_loop import (
     VisionProcessor,
     XGORobot,
     build_parser,
+    gate_initial_reacquire_error,
     limit_reacquire_command,
     load_config,
+    reacquire_search_turn,
 )
 
 
@@ -74,6 +76,10 @@ class LineFollowingRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.vision = VisionProcessor(load_config(ROOT / "line_sign_config.json"))
+
+    def setUp(self):
+        # Each synthetic scene starts a new temporal track. 每个测试独立建轨。
+        self.vision.reset_line_tracking()
 
     def test_centered_start_line_wins_over_broad_floor_shadow(self):
         frame = np.full((240, 320, 3), 220, dtype=np.uint8)
@@ -123,6 +129,71 @@ class LineFollowingRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(analysis.line_error)
         self.assertAlmostEqual(analysis.line_error, 0.0, delta=0.06)
+
+    def test_single_band_dark_fragment_is_not_a_guide_line(self):
+        frame = np.full((240, 320, 3), 220, dtype=np.uint8)
+        # A short piece of the circular marking crosses only the primary band;
+        # two-band consensus must reject it. 单带短黑段不能触发转向。
+        cv2.rectangle(frame, (164, 198), (182, 208), (15, 15, 15), -1)
+
+        analysis = self.vision.analyze(frame)
+
+        self.assertIsNone(analysis.line_error)
+
+    def test_previous_track_wins_over_new_nearer_center_distractor(self):
+        first = np.full((240, 320, 3), 220, dtype=np.uint8)
+        cv2.rectangle(first, (205, 134), (215, 239), (15, 15, 15), -1)
+        self.assertIsNotNone(self.vision.analyze(first).line_error)
+
+        second = np.full((240, 320, 3), 220, dtype=np.uint8)
+        cv2.rectangle(second, (210, 134), (220, 239), (15, 15, 15), -1)
+        cv2.rectangle(second, (169, 134), (179, 239), (15, 15, 15), -1)
+
+        analysis = self.vision.analyze(second)
+
+        self.assertIsNotNone(analysis.line_error)
+        self.assertGreater(analysis.line_error, 0.15)
+
+    def test_circle_arc_does_not_replace_continuous_straight_track(self):
+        first = np.full((240, 320, 3), 220, dtype=np.uint8)
+        cv2.rectangle(first, (190, 134), (200, 239), (15, 15, 15), -1)
+        self.assertIsNotNone(self.vision.analyze(first).line_error)
+
+        second = first.copy()
+        cv2.circle(second, (160, 210), 90, (15, 15, 15), 6)
+        analysis = self.vision.analyze(second)
+
+        self.assertIsNotNone(analysis.line_error)
+        expected = (195.0 - 160.0) / 160.0 - 0.09
+        self.assertAlmostEqual(analysis.line_error, expected, delta=0.05)
+
+    def test_large_one_frame_track_jump_reports_loss_for_safe_stop(self):
+        first = np.full((240, 320, 3), 220, dtype=np.uint8)
+        cv2.rectangle(first, (60, 134), (70, 239), (15, 15, 15), -1)
+        self.assertIsNotNone(self.vision.analyze(first).line_error)
+
+        jumped = np.full((240, 320, 3), 220, dtype=np.uint8)
+        cv2.rectangle(jumped, (260, 134), (270, 239), (15, 15, 15), -1)
+
+        self.assertIsNone(self.vision.analyze(jumped).line_error)
+
+    def test_gradual_guide_motion_does_not_latch_onto_five_band_edge(self):
+        # dog16 contains a persistent dark edge that can win more scan-band
+        # votes whenever the near-field guide widens. Continuity must keep the
+        # gradually moving guide without reporting a long safety-stop loss.
+        # 连续移动的真线优先于始终存在的边缘暗段。
+        errors = []
+        for center in range(170, 251, 20):
+            frame = np.full((240, 320, 3), 220, dtype=np.uint8)
+            cv2.rectangle(
+                frame, (center - 5, 134), (center + 5, 239), (15, 15, 15), -1
+            )
+            cv2.rectangle(frame, (285, 134), (301, 239), (15, 15, 15), -1)
+            errors.append(self.vision.analyze(frame).line_error)
+
+        self.assertTrue(all(error is not None for error in errors))
+        self.assertGreater(errors[-1], 0.30)
+        self.assertLess(errors[-1], 0.70)
 
 
 class SignDistanceLoopTests(unittest.TestCase):
@@ -470,9 +541,13 @@ class YellowReacquireTests(unittest.TestCase):
 
     def action_cfg(self):
         return {
+            "bypass_direction": "right",
             "yellow_reacquire_speed": 6,
             "yellow_reacquire_max_turn": 20,
             "yellow_align_error": 0.35,
+            "yellow_align_kp": 24,
+            "yellow_search_turn": 10,
+            "yellow_search_error_deadband": 0.05,
         }
 
     def test_misaligned_line_holds_position_and_caps_turn(self):
@@ -488,6 +563,42 @@ class YellowReacquireTests(unittest.TestCase):
     def test_forward_is_capped_by_reacquire_speed(self):
         forward, _ = limit_reacquire_command(0.05, 12.0, 4.0, self.action_cfg())
         self.assertEqual(forward, 6.0)
+
+    def test_aligned_pid_spike_is_still_capped(self):
+        forward, turn = limit_reacquire_command(
+            0.05, 6.0, -48.0, self.action_cfg()
+        )
+        self.assertEqual(forward, 6.0)
+        self.assertEqual(turn, -20.0)
+
+    def test_lost_line_search_uses_last_side_without_forward_motion(self):
+        cfg = self.action_cfg()
+        self.assertEqual(reacquire_search_turn(-0.8, cfg), 10.0)
+        self.assertEqual(reacquire_search_turn(0.8, cfg), -10.0)
+
+    def test_centered_pre_bypass_error_falls_back_to_bypass_side(self):
+        cfg = self.action_cfg()
+        self.assertEqual(reacquire_search_turn(0.0, cfg), 10.0)
+        cfg["bypass_direction"] = "left"
+        self.assertEqual(reacquire_search_turn(None, cfg), -10.0)
+
+    def test_far_circle_arc_is_rejected_before_first_line_lock(self):
+        cfg = dict(self.action_cfg(), yellow_acquire_error_max=0.65)
+        error, acquired = gate_initial_reacquire_error(-0.98, False, cfg)
+        self.assertIsNone(error)
+        self.assertFalse(acquired)
+
+    def test_plausible_line_opens_initial_reacquire_gate(self):
+        cfg = dict(self.action_cfg(), yellow_acquire_error_max=0.65)
+        error, acquired = gate_initial_reacquire_error(-0.40, False, cfg)
+        self.assertEqual(error, -0.40)
+        self.assertTrue(acquired)
+
+    def test_temporally_tracked_line_remains_usable_after_lock(self):
+        cfg = dict(self.action_cfg(), yellow_acquire_error_max=0.65)
+        error, acquired = gate_initial_reacquire_error(-0.80, True, cfg)
+        self.assertEqual(error, -0.80)
+        self.assertTrue(acquired)
 
 
 if __name__ == "__main__":
