@@ -1,0 +1,58 @@
+{
+  "source_rule_image": "rule_reference/word/media/image1.png",
+  "source_document": "D:/Downloads/11-智能安全赛—机械狗极限救援.docx",
+  "map_usage": "topological state memory only; never direct pixel-to-field localization",
+  "field_geometry_cm": {
+    "full_field": [350.0, 150.0],
+    "start_zone": [60.0, 40.0],
+    "guide_line_width": 2.0
+  },
+  "own_side": "configure_left_or_right_before_field_run",
+  "outbound_landmark_order": [
+    "start_zone",
+    "guide_line",
+    "single_random_information_sign",
+    "guide_line_after_sign",
+    "assignment_zone"
+  ],
+  "assignment_zone": {
+    "balls": ["red", "green", "blue"],
+    "ball_diameter_cm": 2.8,
+    "task_cups": 2,
+    "cup_mouth_diameter_cm": 7.0,
+    "cup_multipliers": [2, 3],
+    "ball_to_cup_strategy": "all_red_green_blue_balls_to_the_3x_cup",
+    "cup_layout": "one cup on each side of the three central balls"
+  },
+  "safety": {
+    "do_not_cross_red_boundary": true,
+    "all_motion_requires_current_visual_evidence": true,
+    "remembered_ball_positions_are_search_hints_only": true,
+    "home_complete_requires_full_body_inside_start_zone": true,
+    "home_visual_calibration": {
+      "status": "provisional_offline_validation_complete",
+      "return_path_photos": "calibration_images/return_path",
+      "start_zone_entry_photos": "calibration_images/start_zone_entry",
+      "completion_rule": "two transverse rectangle boundaries must first be seen; completion requires both absent across the full image for multiple frames",
+      "remaining_validation": "hardware return plus real off-center/slanted start-zone entry sequences"
+    }
+  },
+  "return_vision": {
+    "module": "return_home_vision.py",
+    "config": "return_home_config.json",
+    "right_field_boundary_policy": "reject candidates attached to the right image edge and stop on lock discontinuity",
+    "arc_usage": "support first guide lock only; never commands motion by itself"
+  },
+  "return_landmark_order": [
+    "assignment_zone",
+    "reverse_for_2_seconds_after_last_drop",
+    "rotate_90_degrees",
+    "if_ball_or_cup_is_visible_rotate_another_45_degrees_then_recheck",
+    "reacquire_original_guide_line_with_arc_context",
+    "follow_guide_line_back",
+    "guide_line_disappears_below_camera",
+    "continue_straight_through_start_zone_rectangle",
+    "both_transverse_black_boundaries_disappear_across_full_frame",
+    "stop"
+  ]
+}

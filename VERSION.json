@@ -1,0 +1,18 @@
+{
+  "version": "dog12_closed_loop",
+  "is_current_latest": true,
+  "based_on": "D:/Desktop/dog10 and senior fin.py motion helpers",
+  "rule_sign_mode": "one random yellow-or-black sign per side",
+  "distance_model_calibrated": true,
+  "three_color_grasp_profiles_calibrated": true,
+  "cup_pre_release_pose_calibrated": true,
+  "ball_to_cup_strategy": "all three balls to the 3x cup",
+  "return_photo_sets_received": true,
+  "return_vision_offline_tests_passed": true,
+  "full_autonomous_competition_run_enabled": false,
+  "remaining_gates": [
+    "post-release ball-in-cup visual confirmation photos",
+    "hardware validation of return guide lock and motion",
+    "real off-center/slanted start-zone entry sequence validation"
+  ]
+}

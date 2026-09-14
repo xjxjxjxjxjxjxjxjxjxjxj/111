@@ -1,0 +1,26 @@
+# ---- Never commit workflow runtime / private data ----
+XGO-AutoLoop/
+_autoloop/
+downloads/
+state/
+logs/
+video_inbox/
+
+# ---- Python caches ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- Run artifacts / media (must not be committed) ----
+*.mp4
+*.avi
+*.mov
+*.jsonl
+*.partial.*
+*.downloading
+
+# ---- OS / editor ----
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/

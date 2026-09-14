@@ -1,0 +1,41 @@
+{
+  "paths": {
+    "root": "D:/Desktop/dog11_closed_loop/XGO-AutoLoop",
+    "current_project": "D:/Desktop/dog11_closed_loop/XGO-AutoLoop/current/dog11_closed_loop",
+    "video_inbox": "D:/Desktop/dog11_closed_loop/XGO-AutoLoop/video_inbox",
+    "reports": "D:/Desktop/dog11_closed_loop/XGO-AutoLoop/reports",
+    "releases": "D:/Desktop/dog11_closed_loop/XGO-AutoLoop/releases",
+    "work": "D:/Desktop/dog11_closed_loop/XGO-AutoLoop/work",
+    "logs": "D:/Desktop/dog11_closed_loop/XGO-AutoLoop/logs",
+    "state": "D:/Desktop/dog11_closed_loop/XGO-AutoLoop/state"
+  },
+  "robot": {
+    "ssh_target": "SET_ME，例如 pi@192.168.1.88",
+    "remote_project_dir": "/home/pi/xgo-autoloop/current",
+    "remote_recording_dir": "/home/pi/xgo-autoloop/recordings",
+    "python": "python3",
+    "entry_point": "sign_line_closed_loop.py",
+    "entry_args": ["--mode", "run", "--start-delay", "5"],
+    "maximum_run_seconds": 300
+  },
+  "recording": {
+    "extension": ".mp4",
+    "fps": 20.0,
+    "delete_robot_copy_after_verified_download": true,
+    "delete_local_video_after_codex_success": true,
+    "keep_telemetry_with_report": true
+  },
+  "codex": {
+    "executable": "auto",
+    "initial_wait_seconds": 300,
+    "poll_seconds": 100,
+    "sandbox": "workspace-write",
+    "approval_policy": "never"
+  },
+  "github": {
+    "handled_by": "opencode",
+    "repository_dir": "SET_ME",
+    "workflow_instructions_file": "OPENCODE_GITHUB.md",
+    "push_branch": "SET_ME"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "purpose": "recognition regression only",
+  "allowed_uses": [
+    "ball color threshold tuning",
+    "ball shape-filter tuning",
+    "yellow sign appearance testing",
+    "false-positive regression testing"
+  ],
+  "forbidden_uses": [
+    "ball grasp point calibration",
+    "ball grasp distance calibration",
+    "sign 20 cm warning-point calibration",
+    "course motion timing calibration"
+  ],
+  "samples": [
+    {"file": "dog_photo_20260913_101921.jpg", "scene": "balls", "expected_valid_balls": ["blue", "green", "red"], "sign_truth": null, "expected_yellow_evidence": false, "note": "arm visible; recognition only"},
+    {"file": "dog_photo_20260913_102153.jpg", "scene": "balls", "expected_valid_balls": ["blue", "green", "red"], "sign_truth": null, "expected_yellow_evidence": false, "note": "near view"},
+    {"file": "dog_photo_20260913_102246.jpg", "scene": "balls", "expected_valid_balls": ["blue", "green", "red"], "sign_truth": null, "expected_yellow_evidence": false, "note": "middle view"},
+    {"file": "dog_photo_20260913_104132.jpg", "scene": "sign", "expected_valid_balls": [], "sign_truth": "black", "expected_yellow_evidence": false, "note": "black sign, frontal/angled"},
+    {"file": "dog_photo_20260913_104213.jpg", "scene": "sign", "expected_valid_balls": [], "sign_truth": "black", "expected_yellow_evidence": false, "note": "black sign, farther/angled"},
+    {"file": "dog_photo_20260913_104236.jpg", "scene": "sign", "expected_valid_balls": [], "sign_truth": "black", "expected_yellow_evidence": false, "note": "edge-on; a single frame is non-actionable"},
+    {"file": "dog_photo_20260913_104304.jpg", "scene": "sign", "expected_valid_balls": [], "sign_truth": "black", "expected_yellow_evidence": false, "note": "black sign, frontal"},
+    {"file": "dog_photo_20260913_104344.jpg", "scene": "sign", "expected_valid_balls": [], "sign_truth": "yellow", "expected_yellow_evidence": true, "note": "yellow sign, frontal"},
+    {"file": "dog_photo_20260913_104359.jpg", "scene": "sign", "expected_valid_balls": [], "sign_truth": "yellow", "expected_yellow_evidence": true, "note": "yellow sign, frontal/angled"},
+    {"file": "dog_photo_20260913_104416.jpg", "scene": "sign", "expected_valid_balls": [], "sign_truth": "yellow", "expected_yellow_evidence": false, "note": "edge-on; expected unknown, never infer black from this frame"},
+    {"file": "dog_photo_20260913_104438.jpg", "scene": "balls", "expected_valid_balls": ["blue", "green", "red"], "sign_truth": null, "expected_yellow_evidence": false, "note": "farther centered view"},
+    {"file": "dog_photo_20260913_104504.jpg", "scene": "balls", "expected_valid_balls": ["blue", "green", "red"], "sign_truth": null, "expected_yellow_evidence": false, "note": "right-offset darker view"},
+    {"file": "dog_photo_20260913_104529.jpg", "scene": "balls", "expected_valid_balls": ["blue", "green", "red"], "sign_truth": null, "expected_yellow_evidence": false, "note": "right-offset view"},
+    {"file": "dog_photo_20260913_104549.jpg", "scene": "balls", "expected_valid_balls": ["blue", "green", "red"], "sign_truth": null, "expected_yellow_evidence": false, "note": "left-offset view"},
+    {"file": "dog_photo_20260913_104649.jpg", "scene": "balls", "expected_valid_balls": [], "sign_truth": null, "expected_yellow_evidence": false, "note": "only a partial blue ball is visible at the frame edge; reject as actionable target"}
+  ]
+}

@@ -1,0 +1,99 @@
+{
+  "camera": {
+    "width": 320,
+    "height": 240,
+    "rotate_180": false
+  },
+  "line": {
+    "roi": [0.05, 0.56, 0.95, 1.0],
+    "gray_max": 105,
+    "min_area_px": 90,
+    "line_target_offset": 0.45
+  },
+  "sign": {
+    "roi": [0.12, 0.20, 0.88, 0.78],
+    "yellow_hsv_low": [20, 100, 50],
+    "yellow_hsv_high": [38, 255, 255],
+    "black_value_min": 35,
+    "black_value_max": 90,
+    "black_value_ratio": 0.38,
+    "black_open_kernel": 13,
+    "black_hough": {
+      "enabled": true,
+      "param1": 55,
+      "param2": 8,
+      "min_center_distance_px": 5,
+      "min_radius_px": 8,
+      "max_radius_px": 22,
+      "min_inner_ring_contrast": 25,
+      "max_inner_median": 55,
+      "stem_gray_max": 70,
+      "min_stem_row_support": 0.50,
+      "min_score": 220,
+      "radius_refine_disagreement_penalty": 50
+    },
+    "min_area_px": 120,
+    "min_radius_px": 8,
+    "min_aspect": 0.72,
+    "max_aspect": 1.38,
+    "min_circularity": 0.58,
+    "min_fill_ratio": 0.60,
+    "min_candidate_confidence": 0.68,
+    "edge_margin_px": 3,
+    "confirm_frames": 5,
+    "max_center_jitter_px": 18,
+    "max_radius_jitter_px": 9,
+    "clear_frames": 12
+  },
+  "course": {
+    "information_sign_count": 1,
+    "information_sign_mode": "single_random_yellow_or_black",
+    "ignore_signs_after_first_action": true
+  },
+  "distance_control": {
+    "geometry_config": "camera_geometry.json",
+    "target_distance_cm": 20.0,
+    "distance_tolerance_cm": 2.5,
+    "distance_kp": 0.55,
+    "min_forward_command": 4.0,
+    "max_forward_command": 12.0,
+    "max_reverse_command": 5.0,
+    "target_lock_confirm_frames": 2,
+    "target_lost_stop_s": 0.30,
+    "maximum_valid_distance_cm": 160.0
+  },
+  "motion": {
+    "pace": "slow",
+    "forward_speed": 12,
+    "min_forward_speed": 6,
+    "kp": 52,
+    "ki": 2,
+    "kd": 5,
+    "max_turn": 48,
+    "command_interval_s": 0.08,
+    "line_lost_stop_s": 0.25
+  },
+  "actions": {
+    "alarm_file": "anger.wav",
+    "motion_pause_s": 0.6,
+    "bypass_direction": "right",
+    "bypass_lateral_speed": 10,
+    "bypass_lateral_s": 3.0,
+    "bypass_forward_speed": 9,
+    "bypass_forward_s": 4.5,
+    "bypass_return_s": 3.0,
+    "yellow_reacquire_speed": 6,
+    "yellow_center_error_max": 0.10,
+    "yellow_center_frames": 8,
+    "yellow_reacquire_timeout_s": 10.0,
+    "black_follow_speed": 9,
+    "claw_open": 0,
+    "arm_x": 150,
+    "arm_high_z": 65,
+    "arm_low_z": -15,
+    "arm_half_period_s": 0.42,
+    "arm_wave_s": 5.0,
+    "arm_stow_x": 0,
+    "arm_stow_z": 100
+  }
+}

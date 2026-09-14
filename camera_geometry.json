@@ -1,0 +1,73 @@
+{
+  "model": "pinhole_apparent_diameter",
+  "calibrated": true,
+  "focal_length_px": 171.7261,
+  "camera_to_front_cm": 2.6601,
+  "principal_x_px": 160.0,
+  "objects": {
+    "information_sign_diameter_cm": 5.0,
+    "ball_diameter_cm": 2.8
+  },
+  "calibration": {
+    "source": "measured XGO-camera sign photos; recognition library excluded",
+    "method": "least-squares fit of clearance=focal*(5cm/diameter_px)-camera_to_front_offset",
+    "groups": [
+      {
+        "role": "fit",
+        "folder": "sign_yellow_20cm",
+        "distance_cm": 20.0,
+        "color": "yellow",
+        "diameters_px": [
+          38.1904,
+          37.6084,
+          37.6084
+        ]
+      },
+      {
+        "role": "fit",
+        "folder": "sign_yellow_30cm",
+        "distance_cm": 30.0,
+        "color": "yellow",
+        "diameters_px": [
+          26.5066,
+          25.5768,
+          26.9568
+        ]
+      },
+      {
+        "role": "validation",
+        "folder": "sign_black_20cm",
+        "distance_cm": 20.0,
+        "color": "black",
+        "diameters_px": [
+          36.0,
+          38.0,
+          42.0
+        ],
+        "errors_cm": [
+          1.1908,
+          -0.0645,
+          -2.2165
+        ]
+      },
+      {
+        "role": "validation",
+        "folder": "sign_black_30cm",
+        "distance_cm": 30.0,
+        "color": "black",
+        "diameters_px": [
+          30.0,
+          22.0,
+          26.0
+        ],
+        "errors_cm": [
+          -4.039,
+          6.3686,
+          0.3642
+        ]
+      }
+    ],
+    "sample_count": 6,
+    "fit_rmse_cm": 0.5233
+  }
+}

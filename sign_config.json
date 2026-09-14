@@ -1,0 +1,24 @@
+{
+  "camera": {
+    "width": 320,
+    "height": 240
+  },
+  "yellow_sign_roi": [0.225, 0.35, 0.775, 0.725],
+  "yellow_hsv_ranges": [
+    [[20, 100, 50], [38, 255, 255]]
+  ],
+  "geometry": {
+    "min_area_px": 120,
+    "min_radius_px": 8,
+    "max_radius_px": 28,
+    "min_aspect": 0.65,
+    "max_aspect": 1.35,
+    "min_circularity": 0.65,
+    "min_fill_ratio": 0.60
+  },
+  "policy": {
+    "edge_on_result": "unknown",
+    "black_by_yellow_absence_allowed_only_at_known_course_checkpoint": true,
+    "warning_distance_calibrated_from_this_library": false
+  }
+}

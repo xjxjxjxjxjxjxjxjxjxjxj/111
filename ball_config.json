@@ -1,0 +1,195 @@
+{
+  "camera": {
+    "width": 320,
+    "height": 240
+  },
+  "ball_roi": [
+    0.0,
+    0.45,
+    1.0,
+    1.0
+  ],
+  "colors": {
+    "blue": {
+      "hsv_ranges": [
+        [
+          [
+            100,
+            140,
+            45
+          ],
+          [
+            116,
+            255,
+            255
+          ]
+        ]
+      ]
+    },
+    "green": {
+      "hsv_ranges": [
+        [
+          [
+            50,
+            80,
+            55
+          ],
+          [
+            76,
+            255,
+            255
+          ]
+        ]
+      ]
+    },
+    "red": {
+      "hsv_ranges": [
+        [
+          [
+            0,
+            130,
+            50
+          ],
+          [
+            8,
+            255,
+            255
+          ]
+        ],
+        [
+          [
+            170,
+            130,
+            50
+          ],
+          [
+            179,
+            255,
+            255
+          ]
+        ]
+      ]
+    }
+  },
+  "geometry": {
+    "min_area_px": 80,
+    "min_radius_px": 6,
+    "max_radius_px": 35,
+    "min_aspect": 0.65,
+    "max_aspect": 1.5,
+    "min_circularity": 0.62,
+    "min_fill_ratio": 0.56
+  },
+  "sampling": {
+    "frames": 7,
+    "min_valid_frames": 4,
+    "timeout_s": 2.0,
+    "frame_interval_s": 0.05,
+    "max_center_jitter_px": 9,
+    "max_radius_jitter_px": 4
+  },
+  "alignment": {
+    "calibrated_for_grasp": true,
+    "parameter_source": "each color uses only its own successful-grasp photos",
+    "geometry_config": "camera_geometry.json",
+    "profiles": {
+      "blue": {
+        "target_x_px": 159.8303,
+        "target_distance_cm": 7.8361,
+        "successful_x_range_px": [
+          159.3705,
+          160.2902
+        ],
+        "successful_distance_range_cm": [
+          7.2708,
+          8.4013
+        ],
+        "x_tolerance_px": 4.0,
+        "distance_tolerance_cm": 0.8,
+        "sample_count": 2
+      },
+      "green": {
+        "target_x_px": 173.484,
+        "target_distance_cm": 6.5999,
+        "successful_x_range_px": [
+          171.4722,
+          176.7044
+        ],
+        "successful_distance_range_cm": [
+          6.0808,
+          7.2106
+        ],
+        "x_tolerance_px": 4.0,
+        "distance_tolerance_cm": 0.8,
+        "sample_count": 3
+      },
+      "red": {
+        "target_x_px": 158.4564,
+        "target_distance_cm": 7.4614,
+        "successful_x_range_px": [
+          154.7064,
+          162.2065
+        ],
+        "successful_distance_range_cm": [
+          5.7992,
+          9.1237
+        ],
+        "x_tolerance_px": 4.7501,
+        "distance_tolerance_cm": 1.8623,
+        "sample_count": 2
+      }
+    },
+    "required_aligned_batches": 2,
+    "max_adjustments": 14,
+    "max_missed_batches": 4
+  },
+  "target_memory": {
+    "initial_choice": "nearest_by_calibrated_distance",
+    "lock_color_until_grasp_attempt_finishes": true,
+    "remember_other_ball_positions": true,
+    "remembered_positions_are_search_hints_only": true,
+    "must_redetect_before_each_move": true,
+    "maximum_hint_age_s": 30.0
+  },
+  "cup_alignment": {
+    "pre_release_calibrated": true,
+    "post_release_verification_calibrated": false,
+    "parameter_source": "four empty-cup pre-release pose photos; target is the robust median of ellipse fits",
+    "target_x_px": 168.7,
+    "target_y_px": 189.6,
+    "target_major_axis_px": 94.0,
+    "target_minor_axis_px": 41.5,
+    "x_tolerance_px": 11.0,
+    "major_axis_tolerance_px": 11.0,
+    "required_aligned_batches": 2,
+    "max_adjustments": 12,
+    "max_missed_batches": 4,
+    "sampling_frames": 7,
+    "minimum_valid_frames": 4,
+    "sampling_interval_s": 0.06,
+    "require_visual_confirmation_before_release": true,
+    "require_visual_confirmation_after_release": true,
+    "post_release_parameter_source": "pending photos showing a colored ball successfully inside the cup"
+  },
+  "motion": {
+    "settle_s": 0.6,
+    "lateral_min_command": 6,
+    "lateral_max_command": 10,
+    "lateral_seconds_per_pixel": 0.012,
+    "lateral_min_s": 0.24,
+    "lateral_max_s": 0.55,
+    "forward_command": 6,
+    "backward_command": -5,
+    "longitudinal_base_s": 0.22,
+    "longitudinal_seconds_per_cm": 0.035,
+    "longitudinal_max_s": 0.5
+  },
+  "grasp_verification": {
+    "frames": 7,
+    "required_valid_frames": 5,
+    "maximum_source_hits": 1,
+    "source_neighborhood_px": 32,
+    "frame_interval_s": 0.06,
+    "max_grasp_attempts": 2
+  }
+}
