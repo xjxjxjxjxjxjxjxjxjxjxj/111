@@ -6,9 +6,12 @@
   },
   "line": {
     "roi": [0.05, 0.56, 0.95, 1.0],
-    "gray_max": 105,
+    "gray_max": 80,
     "min_area_px": 90,
-    "line_target_offset": 0.45
+    "require_bottom_connection": true,
+    "max_width_ratio": 0.3,
+    "min_vertical_aspect": 1.15,
+    "line_target_offset": 0.09
   },
   "sign": {
     "roi": [0.12, 0.20, 0.88, 0.78],

@@ -65,6 +65,36 @@ class CameraGeometryTests(unittest.TestCase):
         self.assertTrue(all(abs(value) < 1e-8 for value in residuals))
 
 
+class LineFollowingRegressionTests(unittest.TestCase):
+    """Regression coverage derived from the dog14 wrong-right-turn video."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.vision = VisionProcessor(load_config(ROOT / "line_sign_config.json"))
+
+    def test_centered_start_line_wins_over_broad_floor_shadow(self):
+        frame = np.full((240, 320, 3), 220, dtype=np.uint8)
+        # The aligned line appears at x~=173 with this camera mounting.  The old
+        # gray_max=105/area-first detector selected the much larger value-95
+        # region on the right and commanded the wrong-right turn instead.
+        cv2.rectangle(frame, (164, 134), (182, 239), (15, 15, 15), -1)
+        cv2.rectangle(frame, (210, 134), (319, 239), (95, 95, 95), -1)
+
+        analysis = self.vision.analyze(frame)
+
+        self.assertIsNotNone(analysis.line_error)
+        self.assertAlmostEqual(analysis.line_error, 0.0, delta=0.06)
+
+    def test_broad_dark_object_is_line_loss_not_a_steering_target(self):
+        frame = np.full((240, 320, 3), 220, dtype=np.uint8)
+        cv2.rectangle(frame, (200, 155), (319, 239), (15, 15, 15), -1)
+
+        analysis = self.vision.analyze(frame)
+
+        self.assertIsNone(analysis.line_error)
+        self.assertEqual(analysis.line_coverage, 0.0)
+
+
 class SignDistanceLoopTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

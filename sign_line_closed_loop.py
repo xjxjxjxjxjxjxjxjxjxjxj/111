@@ -130,6 +130,22 @@ class VisionProcessor:
                 continue
             bx, by, bw, bh = cv2.boundingRect(contour)
             touches_bottom = by + bh >= mask.shape[0] - 3
+            # dog14 field evidence showed that a permissive dark-pixel mask can
+            # prefer a floor shadow or a nearby bin over the 20 mm guide line.
+            # Outbound guide-line pixels must enter from the bottom of this low
+            # ROI and form a narrow, predominantly vertical component.  Rejecting
+            # implausible blobs deliberately falls through to the existing
+            # line-lost safety stop instead of steering from background clutter.
+            if bool(self.line_cfg.get("require_bottom_connection", False)) and not touches_bottom:
+                continue
+            if bw / float(mask.shape[1]) > float(
+                self.line_cfg.get("max_width_ratio", 1.0)
+            ):
+                continue
+            if bh / max(float(bw), 1.0) < float(
+                self.line_cfg.get("min_vertical_aspect", 0.0)
+            ):
+                continue
             moments = cv2.moments(contour)
             if moments["m00"] <= 0:
                 continue
