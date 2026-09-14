@@ -122,50 +122,51 @@ class VisionProcessor:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
         roi_area = float(mask.shape[0] * mask.shape[1])
-        best = None
-        best_score = -1.0
-        for contour in self._contours(mask):
-            area = cv2.contourArea(contour)
-            if area < float(self.line_cfg["min_area_px"]):
-                continue
-            bx, by, bw, bh = cv2.boundingRect(contour)
-            touches_bottom = by + bh >= mask.shape[0] - 3
-            # dog14 field evidence showed that a permissive dark-pixel mask can
-            # prefer a floor shadow or a nearby bin over the 20 mm guide line.
-            # Outbound guide-line pixels must enter from the bottom of this low
-            # ROI and form a narrow, predominantly vertical component.  Rejecting
-            # implausible blobs deliberately falls through to the existing
-            # line-lost safety stop instead of steering from background clutter.
-            if bool(self.line_cfg.get("require_bottom_connection", False)) and not touches_bottom:
-                continue
-            if bw / float(mask.shape[1]) > float(
-                self.line_cfg.get("max_width_ratio", 1.0)
-            ):
-                continue
-            if bh / max(float(bw), 1.0) < float(
-                self.line_cfg.get("min_vertical_aspect", 0.0)
-            ):
-                continue
-            moments = cv2.moments(contour)
-            if moments["m00"] <= 0:
-                continue
-            cx = moments["m10"] / moments["m00"]
-            center_bias = 1.0 - min(abs(cx - mask.shape[1] / 2) / mask.shape[1], 0.8)
-            score = area * center_bias * (1.8 if touches_bottom else 1.0)
-            if score > best_score:
-                best = contour
-                best_score = score
+        height, width = mask.shape[:2]
+        # dog15 field evidence: segmenting the whole ROI let a floor shadow or a
+        # nearby dark object merge with the 20 mm guide line, and the merged blob
+        # then failed the narrow-line geometry so the line was reported lost on
+        # most frames (robot stopped).  The guide line is whatever passes under
+        # the robot, so locate it in a thin BOTTOM band using a per-column dark
+        # profile and require a narrow run.  Wide merged regions are rejected and
+        # fall through to the existing line-lost safety stop. 底部窄带列剖面：
+        # 只有窄的竖直暗色段才算引导线，避免大面积暗块被判成线或把线粘连丢掉。
+        band_h = int(self.line_cfg.get("scan_band_px", 18))
+        band_h = max(4, min(height, band_h))
+        dark_fraction = (mask[height - band_h:height, :] > 0).mean(axis=0)
+        dark_threshold = float(self.line_cfg.get("scan_col_dark", 0.55))
+        min_width = int(self.line_cfg.get("scan_min_width_px", 4))
+        max_width = int(float(self.line_cfg.get("scan_max_width_ratio", 0.22)) * width)
+        max_width = max(min_width + 1, max_width)
 
-        if best is None:
+        runs = []
+        run_start = None
+        for column in range(width):
+            if dark_fraction[column] >= dark_threshold and run_start is None:
+                run_start = column
+            elif dark_fraction[column] < dark_threshold and run_start is not None:
+                runs.append((run_start, column - 1))
+                run_start = None
+        if run_start is not None:
+            runs.append((run_start, width - 1))
+
+        valid = [
+            (start, end)
+            for start, end in runs
+            if min_width <= (end - start + 1) <= max_width
+        ]
+        if not valid:
             return None, 0.0, mask, (x1, y1, x2, y2)
 
-        moments = cv2.moments(best)
-        cx = moments["m10"] / moments["m00"]
-        target_offset = float(self.line_cfg.get("line_target_offset", 0.0))
-        normalized_error = (
-            (cx - mask.shape[1] / 2) / (mask.shape[1] / 2) - target_offset
+        # Prefer the run closest to the image centre; normally the guide line is
+        # the only narrow bottom run.
+        start, end = min(
+            valid, key=lambda run: abs((run[0] + run[1]) / 2.0 - width / 2.0)
         )
-        coverage = cv2.contourArea(best) / roi_area
+        cx = (start + end) / 2.0
+        target_offset = float(self.line_cfg.get("line_target_offset", 0.0))
+        normalized_error = (cx - width / 2.0) / (width / 2.0) - target_offset
+        coverage = ((end - start + 1) * band_h) / roi_area
         return (
             float(clamp(normalized_error, -1.0, 1.0)),
             float(coverage),

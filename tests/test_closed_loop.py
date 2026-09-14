@@ -94,6 +94,19 @@ class LineFollowingRegressionTests(unittest.TestCase):
         self.assertIsNone(analysis.line_error)
         self.assertEqual(analysis.line_coverage, 0.0)
 
+    def test_merged_dark_region_higher_up_does_not_hide_the_guide_line(self):
+        # dog15 evidence: a wide dark region merged with the guide line in
+        # whole-ROI contours and made the detector report line loss on ~90% of
+        # frames.  The bottom band must still isolate the narrow guide line.
+        frame = np.full((240, 320, 3), 220, dtype=np.uint8)
+        cv2.rectangle(frame, (164, 134), (182, 239), (15, 15, 15), -1)  # guide line
+        cv2.rectangle(frame, (0, 134), (166, 200), (60, 60, 60), -1)  # merged dark area
+
+        analysis = self.vision.analyze(frame)
+
+        self.assertIsNotNone(analysis.line_error)
+        self.assertAlmostEqual(analysis.line_error, 0.0, delta=0.06)
+
 
 class SignDistanceLoopTests(unittest.TestCase):
     @classmethod
