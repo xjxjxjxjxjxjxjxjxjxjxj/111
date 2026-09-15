@@ -1,0 +1,3584 @@
+import cv2
+import numpy as np
+from smartcar import logger, CountRecord, PID
+from car_wrap_2026 import MyCar, kill_other_python
+import time
+import math
+import os
+import re
+import shutil
+import subprocess
+
+
+def _config_switch(config, key, default):
+    """兼容 YAML 中 0/1、布尔值和字符串形式的性能开关。"""
+    if not isinstance(config, dict):
+        return bool(default)
+    value = config.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+"""
+- water_l3
+- lable_blue
+- h_you_cai
+- h_qin_cai
+- h_xi_lan_hua
+- h_qing_jiao
+- h_mo_gu
+- h_fan_qie
+- h_jin_zhen_gu
+- h_tu_dou
+- cylinder_3
+- cylinder_2
+- lable_yellow
+- cylinder_1
+- water_l2
+- water
+- water_l1
+- ball_blue
+- ball_yellow
+"""
+def capture_front_images(car):
+    """拍摄两张前摄像头图片并保存到当前目录。"""
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "front_images")
+    os.makedirs(save_dir, exist_ok=True)
+
+    for idx in range(2):
+        frame = None
+        for _ in range(10):
+            frame = car.cap_side.read()
+            if frame is not None:
+                break
+            time.sleep(0.1)
+
+        if frame is None:
+            print(f"[拍照] 第{idx + 1}张图片读取失败")
+            continue
+
+        filename = os.path.join(save_dir, f"front_{idx + 1}.jpg")
+        cv2.imwrite(filename, frame)
+        print(f"[拍照] 已保存: {filename}")
+        time.sleep(0.5)
+
+
+# ============================================================
+# 一次性曝光标定（启动时调用，后续锁定不变）
+# ============================================================
+def _measure_brightness(frame, roi):
+    """测量 ROI 区域的亮度（HSV V 通道综合分）。返回 float 或 None。"""
+    height, width = frame.shape[:2]
+    x0, y0, x1, y1 = [float(v) for v in roi]
+    px0 = max(0, min(width, int(width * x0)))
+    px1 = max(0, min(width, int(width * x1)))
+    py0 = max(0, min(height, int(height * y0)))
+    py1 = max(0, min(height, int(height * y1)))
+    roi_frame = frame[py0:py1, px0:px1]
+    if roi_frame.size == 0:
+        return None
+
+    value_channel = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)[:, :, 2]
+    scale = min(1.0, 160.0 / max(1, value_channel.shape[1]))
+    if scale < 1.0:
+        value_channel = cv2.resize(
+            value_channel,
+            (max(8, int(value_channel.shape[1] * scale)),
+             max(8, int(value_channel.shape[0] * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    pixels = value_channel.reshape(-1).astype(np.float32)
+    p10, p50, p90 = np.percentile(pixels, [10, 50, 90])
+    trimmed = pixels[(pixels >= p10) & (pixels <= p90)]
+    trimmed_mean = float(trimmed.mean()) if trimmed.size else float(p50)
+    return 0.65 * float(p50) + 0.35 * trimmed_mean
+
+
+def calibrate_exposure_once(cap, device_path, camera_label="camera",
+                             target_luma=120, exposure_max=157, exposure_min=1,
+                             roi=(0.08, 0.08, 0.92, 0.92), deadband=8,
+                             max_iterations=6, samples=5):
+    """
+    一次性曝光标定：车辆静止时测量画面亮度，调节曝光值后锁定。
+
+    参数:
+        cap:            Camera 对象（需有 .read() → BGR frame）
+        device_path:    V4L2 设备路径，如 "/dev/video0"
+        camera_label:   日志标签
+        target_luma:    目标亮度（HSV V 通道，0-255）
+        exposure_max:   曝光值安全上限
+        exposure_min:   曝光值下限
+        roi:            亮度统计 ROI [x0, y0, x1, y1] 归一化坐标
+        deadband:       死区，|实测-目标| ≤ deadband 即停止
+        max_iterations: 最大调节轮数
+        samples:        每轮采样帧数（取中位数）
+
+    返回:
+        (final_exposure: int, final_score: float)，失败返回 (None, None)
+    """
+    v4l2 = shutil.which("v4l2-ctl")
+    if not v4l2:
+        print(f"[CALIB][{camera_label}] v4l2-ctl 未找到，跳过标定")
+        return None, None
+
+    # ---- 检测 V4L2 控制项名称 ----
+    try:
+        result = subprocess.run(
+            [v4l2, "-d", device_path, "--list-ctrls-menus"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=3.0,
+        )
+        ctrl_output = (result.stdout or "") + (result.stderr or "")
+    except Exception as exc:
+        print(f"[CALIB][{camera_label}] 无法列出 V4L2 控制项: {exc}")
+        return None, None
+
+    # 查找曝光控制名
+    exp_name = None
+    for name in ("exposure_time_absolute", "exposure_absolute"):
+        if name in ctrl_output:
+            exp_name = name
+            break
+    if exp_name is None:
+        print(f"[CALIB][{camera_label}] 未找到曝光控制项，跳过标定")
+        return None, None
+
+    # 查找自动曝光控制名及其 Manual 模式值
+    auto_name = None
+    manual_value = None
+    for name in ("auto_exposure", "exposure_auto"):
+        if name in ctrl_output:
+            auto_name = name
+            break
+    if auto_name:
+        for line in ctrl_output.splitlines():
+            match = re.search(r"^\s*(-?\d+)\s*:\s*.+manual", line, re.IGNORECASE)
+            if match:
+                manual_value = int(match.group(1))
+                break
+
+    # ---- 读原始状态用于恢复 ----
+    def _v4l2_get(ctrl_name):
+        try:
+            r = subprocess.run(
+                [v4l2, "-d", device_path, "--get-ctrl={}".format(ctrl_name)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=1.0,
+            )
+            m = re.search(r":\s*(-?\d+)\b", (r.stdout or "") + (r.stderr or ""))
+            return int(m.group(1)) if m else None
+        except Exception:
+            return None
+
+    original_auto = _v4l2_get(auto_name) if auto_name else None
+    original_exp = _v4l2_get(exp_name)
+
+    # ---- 切换到手动曝光模式 ----
+    if auto_name and manual_value is not None:
+        subprocess.run(
+            [v4l2, "-d", device_path, "--set-ctrl={}={}".format(auto_name, manual_value)],
+            timeout=1.0,
+        )
+        # 禁用动态帧率（确保曝光值生效）
+        for dyn_name in ("exposure_dynamic_framerate", "exposure_auto_priority"):
+            if dyn_name in ctrl_output:
+                subprocess.run(
+                    [v4l2, "-d", device_path, "--set-ctrl={}=0".format(dyn_name)],
+                    timeout=1.0,
+                )
+
+    # 设置 50Hz 防频闪
+    if "power_line_frequency" in ctrl_output:
+        for line in ctrl_output.splitlines():
+            match = re.search(r"(\d+)\s*:\s*.+50\s*Hz", line, re.IGNORECASE)
+            if match:
+                subprocess.run(
+                    [v4l2, "-d", device_path,
+                     "--set-ctrl=power_line_frequency={}".format(match.group(1))],
+                    timeout=1.0,
+                )
+                break
+
+    # ---- 迭代标定 ----
+    current_exp = max(exposure_min, min(exposure_max, 80))
+    final_score = None
+
+    for iteration in range(max_iterations):
+        # 写入曝光值
+        subprocess.run(
+            [v4l2, "-d", device_path, "--set-ctrl={}={}".format(exp_name, int(current_exp))],
+            timeout=1.0,
+        )
+        time.sleep(0.25)
+
+        # 丢弃缓冲帧
+        for _ in range(3):
+            cap.read()
+
+        # 采样测量
+        scores = []
+        for _ in range(samples):
+            frame = cap.read()
+            if frame is not None:
+                score = _measure_brightness(frame, roi)
+                if score is not None:
+                    scores.append(score)
+
+        if not scores:
+            print(f"[CALIB][{camera_label}] 迭代{iteration}: 无有效帧")
+            break
+
+        avg_score = float(np.median(scores))
+        error = target_luma - avg_score
+        final_score = avg_score
+
+        print(
+            f"[CALIB][{camera_label}] iter={iteration} exp={int(current_exp)} "
+            f"score={avg_score:.1f} target={target_luma} error={error:+.1f}"
+        )
+
+        if abs(error) <= deadband:
+            break
+
+        # 比例调节（限制每次最大 ±50%）
+        ratio = target_luma / max(1.0, avg_score)
+        ratio = max(0.5, min(2.0, ratio))
+        current_exp = int(current_exp * ratio)
+        current_exp = max(exposure_min, min(exposure_max, current_exp))
+
+    print(
+        f"[CALIB][{camera_label}] 标定完成: exp={int(current_exp)} "
+        f"score={final_score:.1f}" +
+        (f" (原始 auto={original_auto} exp={original_exp})" if original_exp else "")
+    )
+    return int(current_exp), final_score
+
+
+def wait_for_button_start():
+    """
+    阻塞等待 MCU 按键按下信号（MC602 协议）。
+
+    通过 serial_wrap 向 MCU 发送查询指令 77 68 0A 07 01 05 00 00 00 0A，
+    读取响应中第7位（索引 4，去掉帧头尾后）的按键状态。
+    0x0F 表示未按下，0x01 表示按下。
+    只有检测到 0x01 时才会返回。
+    """
+    import time as _time
+    from smartcar.whalesbot.vehicle.base.serial_wrap import serial_wrap
+
+    # MC602 协议：数据部分 = 07 01 05 00 00 00
+    # serial_wrap 会自动加上帧头(77 68)、长度(0A)、帧尾(0A)
+    query_data = bytes.fromhex('07 01 05 00 00 00')
+
+    print("[按键等待] 等待按键按下...")
+    while True:
+        response = serial_wrap.get_anwser(query_data)  # 自带锁，不冲突
+        if response is not None and len(response) >= 5:
+            button_state = response[4]  # 去掉帧头帧尾后索引4 = 原数据索引7
+            if button_state == 0x01:
+                print("[按键等待] 检测到按键按下，开始执行任务！")
+                return
+        _time.sleep(0.1)
+
+def init():
+    time.sleep(1)
+    global my_car
+    my_car = MyCar()
+    my_car.STOP_PARAM = False
+
+    my_car.beep()
+    my_car.beep()
+    my_car.beep()
+    capture_front_images(my_car)
+    my_car.arm.reset_position()
+    my_car.arm.reset_position()
+    my_car.reset_position()
+    my_car.beep()
+    my_car.beep()
+    my_car.beep()
+    wait_for_button_start()
+    my_car.beep()
+    my_car.beep()
+    my_car.beep()
+    time.sleep(1)
+
+def auto_lane_tracing(speed=0.3, dis_hold=0.85):
+    my_car.lane_dis_offset(speed=speed, dis_hold=dis_hold)
+    print(f"巡线停止的位置：{my_car.get_odometry()}")
+
+
+def auto_seeding():
+
+    x_length = 0.45  # 基地前方转角的位置，用于计算播种位置
+    dis = 0.55  # 转角后第一个播种点的距离
+    heading = math.pi / 4  # 车子的方向 45°
+    sin45 = math.sin(heading)  # sin45°
+    # 正对播种点车子的理论位置
+    cylinder_loc = {
+        "cylinder_3": [x_length + dis * sin45, dis * sin45, heading],
+        "cylinder_2": [x_length + (dis + 0.15) * sin45, (dis + 0.15) * sin45, heading],
+        "cylinder_1": [x_length + (dis + 0.3) * sin45, (dis + 0.3) * sin45, heading],
+    }
+    cylinder_list = ["cylinder_3", "cylinder_2", "cylinder_1"]
+    cylinder_set_list = {}
+
+    # 设置机械臂初始状态：4个动作分别控制不同电机/舵机，后台同时进行，不阻塞底盘移动
+    arm_init_threads = [
+        threading.Thread(target=my_car.arm.move_y_position, args=(0.1,), daemon=True),
+        threading.Thread(target=my_car.arm.move_y_position, args=(0.1,), daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position, args=(0.0,), daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position, args=(0.0,), daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle, args=("LEFT",), daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle, args=("LEFT",), daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle, args=("DOWN",), daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle, args=("DOWN",), daemon=True),
+    ]
+    for _t in arm_init_threads:
+        _t.start()
+
+    my_car.lane_dis_offset(speed=0.6, dis_hold=0.85,mode=4)
+    time.sleep(0.5)
+    print(f"巡线停止的位置：{my_car.get_odometry()}")
+    for _t in arm_init_threads:
+        _t.join()   # 机械臂就位后再识别，避免和识别抢机械臂
+
+    for i in range(3):
+        my_car.move_to_position(cylinder_loc[cylinder_list[i]])
+        my_car.move_to_detection_target(time_out=6.0)
+        x, y, z = my_car.get_odometry()
+        pose = [x, y, z, my_car.arm.x_get_position()]
+        pose = [x, y, z, my_car.arm.x_get_position()]
+        print(f"第{i}个播种位置{pose}")
+        cylinder_set_list[cylinder_list[i]] = pose
+        my_car.beep()
+    print("实际播种位置：")
+    print(cylinder_set_list)
+
+    for i in range(3):
+        # 移动手臂到右侧高处
+        my_car.arm.move_y_position(0.1)
+        my_car.arm.move_y_position(0.1)
+        my_car.arm.move_x_position(0.3)
+        my_car.arm.move_x_position(0.3)
+        my_car.arm.set_arm_pose(arm="RIGHT")
+        my_car.arm.set_arm_pose(arm="RIGHT")
+
+        # 对齐目标，识别
+        my_car.move_to_position(cylinder_loc[cylinder_list[i]])
+        time.sleep(0.5)
+        cls_id, label= my_car.move_to_detection_target(time_out=6.0)
+        print(f"识别到目标{cls_id}-{label}")
+        my_car.beep()
+        pose = cylinder_set_list[label]
+
+        # 调整气泵吸嘴对齐目标
+        my_car.adjust_arm_position()
+        # 吸起目标
+        my_car.arm.grasp(False)
+        my_car.arm.grasp(False)
+        my_car.arm.move_y_position(0.01)
+        my_car.arm.move_y_position(0.01)
+        time.sleep(0.5)
+        my_car.arm.move_y_position(0.2)
+        my_car.arm.move_y_position(0.2)
+
+        # 移动到目标播种处
+        my_car.arm.move_x_position(pose[3])
+        my_car.arm.move_x_position(pose[3])
+        my_car.arm.set_arm_pose(arm="LEFT")
+        my_car.arm.set_arm_pose(arm="LEFT")
+        time.sleep(1)
+        my_car.move_to_position(pose[:3])
+        my_car.adjust_arm_position()
+        my_car.arm.move_y_position(0.04)
+        my_car.arm.move_y_position(0.04)
+        my_car.arm.grasp(True)
+        my_car.arm.grasp(True)
+        time.sleep(1)
+
+    my_car.arm.move_y_position(0.1)
+    my_car.arm.move_y_position(0.1)
+    my_car.arm.set_arm_pose(hand="UP")
+    my_car.arm.set_arm_pose(hand="UP")
+    my_car.arm.move_x_position(0.15)
+    my_car.arm.move_x_position(0.15)
+    my_car.move_to_position(cylinder_loc[cylinder_list[0]])
+    print("播种完成")
+    my_car.beep()
+    my_car.beep()
+    my_car.get_odometry(True)
+    my_car.get_distance(True)
+
+def target_shooting_detection() -> list:
+
+    performance_cfg = getattr(my_car, "performance_cfg", {}) or {}
+    timing_log = _config_switch(performance_cfg, "timing_log", 1)
+    task_started = time.monotonic()
+    animal_list = [0, 0, 0, 0]
+    my_car.arm.set_arm_pose(x=0.05, y=0.02, arm="LEFT", hand="UP")
+    my_car.arm.set_arm_pose(x=0.05, y=0.02, arm="LEFT", hand="UP")
+
+    for i in range(4):
+        target_started = time.monotonic()
+        my_car.move_for([0.17,0.0,0.0])
+        time.sleep(0.5)
+        move_elapsed = time.monotonic() - target_started
+
+        detect_started = time.monotonic()
+        cls_id, label, _ = my_car.move_to_detection_target(
+            delta_y=None,
+            save_images=False,
+            success_beeps=0,
+            update_stream=False,
+        )
+        detect_elapsed = time.monotonic() - detect_started
+        analysis_elapsed = None
+        if label == "animal":
+            analysis_started = time.monotonic()
+            res, analysis = my_car.animal_image_analysis(
+                det=getattr(my_car, "_last_selected_det", None),
+                image=getattr(my_car, "_last_selected_img", None),
+            )
+            analysis_elapsed = time.monotonic() - analysis_started
+            if res is not None:
+                my_car.beep()
+                print(f"第{i}个动物分析结果：{res}，{analysis}")
+                animal_list[i] = res
+        if timing_log:
+            analysis_text = f"{analysis_elapsed:.3f}s" if analysis_elapsed is not None else "skipped"
+            print(
+                f"[PERF][target_shooting_detection] target={i} "
+                f"move_settle={move_elapsed:.3f}s detect_align={detect_elapsed:.3f}s "
+                f"animal_analysis={analysis_text} total={time.monotonic() - target_started:.3f}s"
+            )
+    time.sleep(0.5)
+    my_car.beep()
+    if timing_log:
+        print(f"[PERF][target_shooting_detection] total={time.monotonic() - task_started:.3f}s")
+    return animal_list
+
+def target_shooting_detection2() -> list:
+    performance_cfg = getattr(my_car, "performance_cfg", {}) or {}
+    timing_log = _config_switch(performance_cfg, "timing_log", 1)
+    task_started = time.monotonic()
+    animal_list = [0, 0, 0, 0]
+    my_car.arm.move_y_position(0.02)
+    my_car.arm.move_y_position(0.02)
+    my_car.arm.move_x_position(0.1)
+    my_car.arm.move_x_position(0.1)
+    my_car.arm.set_arm_angle("LEFT")
+    my_car.arm.set_arm_angle("LEFT")
+    my_car.arm.set_hand_angle("UP")
+    my_car.arm.set_hand_angle("UP")
+    time.sleep(2)
+    # 侧摄像头拍摄照片保存到 animal_pic 文件夹中（路径固定在 Pyy1 内）
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "animal_pic")
+    os.makedirs(save_dir, exist_ok=True)
+    # 清空旧图，保证本次只分析新拍的 1.jpg、2.jpg
+    for _old in os.listdir(save_dir):
+        os.remove(os.path.join(save_dir, _old))
+
+    # 两个拍摄位之间的前进距离（米），与 target_shooting_detection 的目标间距一致
+    move_step = 0.4
+
+    def _capture_and_save(seq):
+        """读取一帧侧摄像头画面并以固定序号命名保存，最多重试 10 次。"""
+        frame = None
+        for _ in range(10):
+            frame = my_car.cap_front.read()
+            if frame is not None:
+                break
+            time.sleep(0.1)
+        if frame is None:
+            print(f"[打靶拍照] 第{seq}张 侧摄像头读取失败")
+        else:
+            filename = os.path.join(save_dir, f"{seq}.jpg")
+            cv2.imwrite(filename, frame)
+            print(f"[打靶拍照] 第{seq}张 已保存: {filename}")
+
+    # 第 1 张照片
+    _capture_and_save(1)
+
+    # 移动到下一个拍摄位，拍第 2 张照片
+    my_car.move_for([move_step, 0.0, 0.0])
+    time.sleep(0.5)
+    _capture_and_save(2)
+
+
+    # 图片分析改由 __main__ 中的后台线程执行（insect_analysis_task），此处只负责拍照
+def detect_photos(frame, save_debug=False):
+    """
+    动态检测画面中的照片区域（不依赖固定像素位置）。
+
+    使用多种图像处理策略依次尝试检测照片：
+      策略1: 自适应阈值 + 轮廓
+      策略2: Canny 边缘检测 + 轮廓
+      策略3: 固定二值阈值（Otsu）
+
+    按 x 坐标从左到右排序后返回。
+
+    参数:
+        frame:      OpenCV 读取到的 BGR 图像
+        save_debug: 是否保存调试图像到磁盘（默认 False）
+
+    返回:
+        photo_boxes: 检测到的照片坐标列表 [(x1,y1,x2,y2), ...]，按 x 升序排列
+                     检测失败时返回空列表 []
+        debug_img:   带标注的调试图像
+    """
+    h, w = frame.shape[:2]
+    debug_img = frame.copy()
+
+    # ---- 筛选参数（放宽范围，后续再精选） ----
+    MIN_AREA = (w * h) * 0.001     # 至少占画面 0.1%（比之前的 0.5% 更宽松）
+    MAX_AREA = (w * h) * 0.30      # 不超过画面 30%
+    MIN_ASPECT = 0.3               # 宽高比下限
+    MAX_ASPECT = 3.0               # 宽高比上限
+    MIN_DIM = 15                   # 最小边长（像素）
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    all_boxes = []  # 收集所有策略找到的框
+
+    # ============ 策略 1：自适应阈值 ============
+    for block_size, C in [(21, 5), (31, 8), (15, 3)]:
+        binary1 = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, block_size, C
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed1 = cv2.morphologyEx(binary1, cv2.MORPH_CLOSE, kernel, iterations=1)
+        boxes1 = _extract_boxes(closed1, w, h, MIN_AREA, MAX_AREA,
+                                MIN_ASPECT, MAX_ASPECT, MIN_DIM)
+        all_boxes.extend(boxes1)
+        if boxes1:
+            break  # 策略 1 成功就不继续换参数
+
+    # ============ 策略 2：Canny 边缘检测 ============
+    if not all_boxes:
+        for low_t, high_t in [(50, 150), (30, 100), (80, 200)]:
+            edges = cv2.Canny(blurred, low_t, high_t)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            dilated = cv2.dilate(edges, kernel, iterations=2)
+            boxes2 = _extract_boxes(dilated, w, h, MIN_AREA, MAX_AREA,
+                                    MIN_ASPECT, MAX_ASPECT, MIN_DIM)
+            all_boxes.extend(boxes2)
+            if boxes2:
+                break
+
+    # ============ 策略 3：Otsu 二值化 ============
+    if not all_boxes:
+        _, binary3 = cv2.threshold(blurred, 0, 255,
+                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed3 = cv2.morphologyEx(binary3, cv2.MORPH_CLOSE, kernel, iterations=1)
+        boxes3 = _extract_boxes(closed3, w, h, MIN_AREA, MAX_AREA,
+                                MIN_ASPECT, MAX_ASPECT, MIN_DIM)
+        all_boxes.extend(boxes3)
+
+    # ============ 后处理 ============
+    if not all_boxes:
+        if save_debug:
+            _save_debug_images(frame, gray, "no_detection")
+        return [], debug_img
+
+    # 去重合并
+    merged = _merge_overlapping_boxes(all_boxes, iou_threshold=0.4)
+
+    # 按 x 坐标从左到右排序
+    merged.sort(key=lambda b: b[0])
+
+    # 只保留面积最大的 N 个（照片通常不超过 6 张）
+    merged = sorted(merged, key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
+    merged = merged[:6]
+    merged.sort(key=lambda b: b[0])  # 重新按 x 排
+
+    # 画调试标注
+    for i, (x1, y1, x2, y2) in enumerate(merged):
+        color = (0, 255, 0) if i == 0 else (255, 200, 0)
+        cv2.rectangle(debug_img, (x1, y1), (x2, y2), color, 2)
+        cx = (x1 + x2) // 2
+        cv2.putText(debug_img, f"P{i}", (cx - 10, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+    return merged, debug_img
+
+
+def _extract_boxes(binary, w, h, min_area, max_area,
+                   min_aspect, max_aspect, min_dim):
+    """从二值图像中提取符合条件的矩形框。"""
+    contours, _ = cv2.findContours(
+        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return []
+
+    boxes = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+
+        rx, ry, rw, rh = cv2.boundingRect(cnt)
+        aspect = rw / max(rh, 1)
+
+        if aspect < min_aspect or aspect > max_aspect:
+            continue
+        if rw < min_dim or rh < min_dim:
+            continue
+        # 排除贴边
+        if rx <= 2 or ry <= 2 or rx + rw >= w - 2 or ry + rh >= h - 2:
+            continue
+
+        boxes.append((rx, ry, rx + rw, ry + rh))
+
+    return boxes
+
+
+def _save_debug_images(frame, gray, tag):
+    """保存调试图像到 det_photo_debug/ 目录。"""
+    import os as _os
+    debug_dir = "det_photo_debug"
+    _os.makedirs(debug_dir, exist_ok=True)
+    timestamp = int(time.time() * 1000)
+    cv2.imwrite(f"{debug_dir}/{tag}_gray_{timestamp}.jpg", gray)
+    cv2.imwrite(f"{debug_dir}/{tag}_frame_{timestamp}.jpg", frame)
+    print(f"[detect_photos] 调试图像已保存到 {debug_dir}/")
+
+
+def _merge_overlapping_boxes(boxes, iou_threshold=0.3):
+    """
+    合并 IoU 超过阈值的重叠框（贪心合并）。
+
+    参数:
+        boxes: [(x1, y1, x2, y2), ...]
+        iou_threshold: 合并的 IoU 阈值
+
+    返回:
+        merged: 合并后的框列表
+    """
+    if len(boxes) <= 1:
+        return boxes[:]
+
+    # 按面积降序排列，优先保留大框
+    sorted_boxes = sorted(boxes, key=lambda b: (
+        (b[2] - b[0]) * (b[3] - b[1])
+    ), reverse=True)
+
+    merged = []
+    used = [False] * len(sorted_boxes)
+
+    for i, box_a in enumerate(sorted_boxes):
+        if used[i]:
+            continue
+        ax1, ay1, ax2, ay2 = box_a
+        for j, box_b in enumerate(sorted_boxes):
+            if j <= i or used[j]:
+                continue
+            bx1, by1, bx2, by2 = box_b
+
+            # 计算 IoU
+            inter_x1 = max(ax1, bx1)
+            inter_y1 = max(ay1, by1)
+            inter_x2 = min(ax2, bx2)
+            inter_y2 = min(ay2, by2)
+
+            if inter_x1 >= inter_x2 or inter_y1 >= inter_y2:
+                continue
+
+            inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+            area_a = (ax2 - ax1) * (ay2 - ay1)
+            area_b = (bx2 - bx1) * (by2 - by1)
+            union_area = area_a + area_b - inter_area
+            iou = inter_area / union_area if union_area > 0 else 0
+
+            if iou > iou_threshold:
+                # 合并：取包围两个框的最小外接矩形
+                ax1 = min(ax1, bx1)
+                ay1 = min(ay1, by1)
+                ax2 = max(ax2, bx2)
+                ay2 = max(ay2, by2)
+                used[j] = True
+
+        merged.append((ax1, ay1, ax2, ay2))
+        used[i] = True
+
+    return merged
+
+
+def target_shooting(animal_list=[1, 1, 1, 1], shoot_count=3, interval_range=0.02):  # noqa: E741
+    """目标打击函数
+
+    每个打击点到达后，在目标位置前后区间内进行多次射击。
+
+    Args:
+        animal_list: 打击目标列表，0 表示需要打击的目标
+        shoot_count: 每个目标的射击次数（默认 3 次）
+        interval_range: 区间射击的总范围（米），射击点在该范围内均匀分布
+    """
+    #animal_list=[]中0表示需要打击的目标
+    step = 0.13  # 每个目标间距
+    relative_loc = []  # 记录相对运动距离
+    last_index = -1  # 记录上一个打击点的索引，初始为-1
+
+    #记录相对距离
+    for idx, value in enumerate(animal_list):
+        if value == 0:  # 遇到需要打击的点
+            if last_index == -1:
+                # 第一个打击点：相对距离 = 从起点走到这里
+                dist = idx * step
+            else:
+                # 后续打击点：相对距离 = 两个点之间的间隔数 * 0.13
+                dist = (idx - last_index) * step
+            relative_loc.append(dist)
+            last_index = idx  # 更新上一个打击点位置
+    print(relative_loc)
+
+    # 计算区间射击的子位置偏移量（在目标点前后均匀分布）
+    if shoot_count > 1:
+        sub_offsets = [i * interval_range / (shoot_count - 1) - interval_range / 2
+                       for i in range(shoot_count)]
+    else:
+        sub_offsets = [0]
+
+    print("开始寻找打击目标")
+    #移动到需要打击的目标，每个目标进行多次区间射击
+    for idx, dis in enumerate(relative_loc):
+        # 移动到打击点基准位置
+        my_car.lane_dis_offset(speed=0.25, dis_hold=dis)
+
+        # 移动到第一个射击子位置
+        my_car.lane_dis_offset(speed=0.25, dis_hold=sub_offsets[0])
+
+        for shot_idx, offset in enumerate(sub_offsets):
+            if shot_idx > 0:
+                # 移动到下一个射击子位置
+                my_car.move_for([offset - sub_offsets[shot_idx - 1], 0.0, 0.0])
+                #my_car.move_for([offset - sub_offsets[shot_idx - 1], 0.0, 0.0])
+            print(f"目标{idx + 1} - 第{shot_idx + 1}次射击 (偏移: {offset:+.3f}m)")
+            time.sleep(1)
+            my_car.beep()
+            my_car.shooting()
+            time.sleep(1)
+
+        # 区间射击完成后回到目标中心，确保相对位移距离不受子偏移影响
+        my_car.lane_dis_offset(speed=0.25, dis_hold=-sub_offsets[-1])
+
+    #移动到最后一个目标位置
+    #my_car.lane_dis_offset(
+    #    speed=0.3, dis_hold=0.48 - sum(relative_loc)
+    #)  
+
+
+def crop_harvesting():
+    """
+    作物采收
+    """
+    # 调整机械臂
+    # my_car.arm.move_y_position(0.2)
+    # my_car.arm.reset_x()
+    # my_car.arm.set_arm_angle("LEFT")
+    # my_car.arm.set_hand_angle("DOWN")
+
+    my_car.set_storage(False)  # 抬起存储架
+
+    # 移动到任务位置
+    #my_car.lane_dis_offset(speed=0.3, dis_hold=1.0)
+    # my_car.arm.move_y_position(0.14)
+
+    # ---- 手臂伸出距离与 dy 的比例关系 ----
+    # arm_x = ARM_BASE + ARM_K × dy（dy 越大 → 球越近 → 手臂多伸）
+    #ARM_BASE = 0.05   # 基准偏移（dy=0 时的手臂 x）
+    #ARM_K    = 1.0    # 比例系数（可调：调大 → 手臂伸得更远）
+
+    for i in range(8):
+        # 调整机械臂
+        my_car.arm.move_x_position(0.0)
+        my_car.arm.move_x_position(0.0)
+        time.sleep(0.5)
+        my_car.arm.set_arm_angle("LEFT")
+        my_car.arm.set_arm_angle("LEFT")
+        # my_car.arm.move_x_position(0.01)
+        my_car.arm.move_y_position(0.1)
+        my_car.arm.move_y_position(0.1)
+
+        my_car.arm.set_hand_angle("DOWN")
+        my_car.arm.set_hand_angle("DOWN")
+        # 前进一小段
+        my_car.move_for([0.075, 0.0, 0.0])
+        time.sleep(0.5)
+
+        # ---- 每个球都用HSV视觉对准 ----
+        cls_id, label, dy = my_car.move_to_wt3(
+            time_out=30.0, delta_x=-0.035, ball_no=f"{i+1}/8", color_mode=2, use_hsv=True,
+            x_thr=0.08, y_thr=0.08, save_images=0,
+        )
+        # 人工停止检查
+        wt3_result = getattr(my_car, "last_wt3_result", {})
+        if wt3_result.get("reason") == "stopped" or getattr(my_car, "_stop_flag", False):
+            my_car.set_velocity(0, 0, 0)
+            my_car.arm.x_speed(0)
+            my_car.arm.x_speed(0)
+            return
+        if label is not None and label != "None" and cls_id != -1:
+            print(f">>> 第{i+1}球对准完成，dy={dy:+.4f} <<<")
+
+        # 判断是否有效识别
+        is_valid = label is not None and label != "None" and cls_id != -1
+
+        if dy is not None:
+            print(f"发现第{i + 1}个作物，目标为{label}, dy={dy:+.4f}")
+        else:
+            print(f"发现第{i + 1}个作物，目标为{label}, dy=None")
+
+        if not is_valid:
+            print(f"  [跳过] 第{i + 1}次未识别到球，跳过抓取")
+            continue
+
+        time.sleep(0.5)
+        # 机械臂前伸抓取（固定偏移，已验证可用）
+        my_car.adjust_arm_position(dis=0.06)
+        my_car.arm.grasp(False)
+        my_car.arm.grasp(False)
+        my_car.arm.move_y_position(0.01)  # 吸取
+        my_car.arm.move_y_position(0.01)  # 吸取
+        time.sleep(0.5)
+        my_car.arm.move_y_position(0.2)
+        my_car.arm.move_y_position(0.2)
+        my_car.arm.set_arm_angle(-115) 
+        my_car.arm.set_arm_angle(-115) 
+        time.sleep(0.5)   # 转臂   
+        my_car.arm.set_hand_angle(10)
+        my_car.arm.set_hand_angle(10)
+        if label == "ball_yellow":  # 黄球在一号位
+            my_car.arm.move_x_position(0.0)
+            my_car.arm.move_x_position(0.0)
+            my_car.beep()
+        elif label == "ball_blue":
+            my_car.arm.move_x_position(0.04)
+            my_car.arm.move_x_position(0.04)
+            my_car.beep()
+            my_car.beep()
+        # my_car.arm.move_y_position(0.12)
+        time.sleep(0.5)
+        my_car.arm.grasp(True)
+        my_car.arm.grasp(True)
+        time.sleep(1)
+
+    my_car.set_storage(True)  # 放下存储架
+
+
+def sort_and_store():
+    ball_list = [0.0, 0.045]  # 拿黄球时 机械臂x轴0.0, 蓝球0.06
+
+    # 调整机械臂
+    my_car.arm.move_y_position(0.17)
+    my_car.arm.move_y_position(0.17)
+    my_car.arm.move_x_position(0.25)
+    my_car.arm.move_x_position(0.25)
+    my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+    my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+    my_car.arm.move_y_position(0.04)
+    my_car.arm.move_y_position(0.04)
+
+    # 移动到任务位置 前进2.0米
+    # my_car.lane_dis_offset(speed=0.3, dis_hold=2.0)
+    time.sleep(0.5)
+    # 对齐到标签
+    cls_id, label, _ = my_car.move_to_detection_target(time_out=20.0,delta_y=None)
+    time.sleep(0.5)
+    # 根据标签颜色确定要拿的小球
+    if label == "lable_blue":
+        flag = 1
+        pick_hand = 10   # 蓝色球手部角度
+    else:
+        flag = 0
+        pick_hand = 20   # 黄色球手部角度
+
+    for i in range(2):
+        # 第二轮用相反颜色参数
+        cur_hand = pick_hand if i == 0 else (20 if pick_hand == 10 else 10)
+        for j in range(4):
+            # 从储存架拿球
+            my_car.arm.move_y_position(0.15)
+            my_car.arm.move_y_position(0.15)
+            my_car.arm.set_arm_pose(arm=-106, hand=cur_hand)
+            my_car.arm.set_arm_pose(arm=-106, hand=cur_hand)
+            my_car.arm.move_x_position(ball_list[(i + flag) % 2])  # 移动机械臂x轴
+            my_car.arm.move_x_position(ball_list[(i + flag) % 2])  # 移动机械臂x轴
+            my_car.arm.grasp(False)
+            my_car.arm.grasp(False)
+            my_car.arm.move_y_position(0.05)
+            my_car.arm.move_y_position(0.05)
+            time.sleep(0.5)
+            my_car.arm.move_y_position(0.15)
+            my_car.arm.move_y_position(0.15)
+            my_car.arm.move_x_position(0.30)
+            my_car.arm.move_x_position(0.30)
+            my_car.arm.set_arm_pose(arm=94, hand="UP")
+            my_car.arm.set_arm_pose(arm=94, hand="UP")
+            my_car.arm.move_y_position(0.2 - i * 0.15)
+            my_car.arm.move_y_position(0.2 - i * 0.15)
+            time.sleep(0.5)
+            my_car.arm.move_x_position(0.18)
+            my_car.arm.move_x_position(0.18)
+            time.sleep(0.5)
+            my_car.arm.grasp(True)
+            my_car.arm.grasp(True)
+            time.sleep(0.5)
+            my_car.arm.move_x_position(0.30)
+            my_car.arm.move_x_position(0.30)
+        if i == 1:
+            break
+        my_car.move_for([-0.155, 0, 0])
+
+
+# 寻找货物的程序
+def find_goods(label, dy=-0.5):
+    """
+    货物识别函数
+
+    修改：
+    1. 不允许底盘移动
+    2. 只调整机械臂姿态
+    3. 支持上下层一次切换
+
+    返回：
+        True  : 找到目标
+        False : 没找到
+    """
+
+    # =====================================================
+    # 搜索策略
+    #
+    # 注意：
+    # 这里不能移动小车
+    # 因为会破坏定位
+    # =====================================================
+
+    strategies = [
+
+        (
+            "默认姿态",
+            lambda: None
+        ),
+
+        (
+            "机械臂X=0.20",
+            lambda: (my_car.arm.move_x_position(0.20), my_car.arm.move_x_position(0.20))
+        ),
+
+        (
+            "机械臂X=0.30",
+            lambda: (my_car.arm.move_x_position(0.30), my_car.arm.move_x_position(0.30))
+        ),
+
+    ]
+
+
+    # =====================================================
+    # 两个高度
+    #
+    # 第一高度：
+    #   看上面两个货物
+    #
+    # 第二高度：
+    #   看下面两个货物
+    # =====================================================
+
+    y_positions = [
+
+        0.15,
+
+        0.08
+
+    ]
+
+
+    for y_pos in y_positions:
+
+        print(
+            f"[find_goods] "
+            f"当前搜索高度 Y={y_pos}"
+        )
+
+
+        # 调整摄像头高度
+
+        my_car.arm.move_y_position(
+            y_pos
+        )
+        my_car.arm.move_y_position(
+            y_pos
+        )
+
+        time.sleep(0.4)
+
+
+        for strategy_name, prepare in strategies:
+
+
+            print(
+                f"[find_goods] "
+                f"执行策略：{strategy_name}"
+            )
+
+
+            prepare()
+
+
+            time.sleep(0.4)
+
+
+
+            # 同一位置尝试两次
+
+            for attempt in range(2):
+
+
+                cls_id, det_label, _ = my_car.move_to_detection_target(
+                    label=label,
+                    delta_y=dy,
+                    time_out=1.5
+                )
+
+
+                print(
+                    f"[{strategy_name}] "
+                    f"高度={y_pos} "
+                    f"第{attempt+1}次:"
+                    f"{det_label}"
+                )
+
+
+                # =================================================
+                # 关键：
+                #
+                # 必须确认目标标签一致
+                #
+                # 防止：
+                # 番茄 -> 蘑菇
+                # =================================================
+
+                if det_label == label:
+
+
+                    print(
+                        f"[find_goods] "
+                        f"识别成功：{label}"
+                    )
+
+
+                    return {
+                            "success": True,
+                            "label": det_label,
+                            "x_error": 0.0
+                        }
+
+
+
+                time.sleep(0.2)
+
+
+
+    print(
+        f"[find_goods] "
+        f"未找到目标：{label}"
+    )
+
+
+    return {
+        "success": False,
+        "label": None,
+        "x_error": 0.0
+    }
+
+
+
+def find_name(name="name"):
+    name_list = []
+    for i in range(3):
+        my_car.move_to_detection_target(delta_y=None)
+        time.sleep(1)
+        dets = my_car.get_detection_results(sort_pos=(0, 0.5), limit_x=0.3)
+        for j, det in enumerate(dets):
+            text = my_car.get_det_ocr(det)
+            print(f'第{i}列第{j}行的姓名：{text}')
+            time.sleep(5)
+            if text == name:
+                return i, j  # i为0 是下层，为上层
+        if i < 2:
+            my_car.lane_dis_offset(speed=0.3, dis_hold=0.11)
+
+
+def order_delivery(    order_list = [
+        {"name": "李四", "goods": "芹菜", "address": 2},
+        {"name": "钱七", "goods": "青椒", "address": 2},
+    ]):
+
+
+    my_car.lane_dis_offset(speed=0.3, dis_hold=3.25)
+
+    time.sleep(1)
+    my_car.arm.move_y_position(0.2)
+    my_car.arm.move_y_position(0.2)
+    my_car.arm.move_x_position(0.3)
+    my_car.arm.move_x_position(0.3)
+    my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+    my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+    time.sleep(1)
+    cls_id, label, _ = my_car.move_to_detection_target(delta_y=None)
+    if label is None:
+        my_car.lane_dis_offset(speed=0.3, dis_hold=0.12)
+    time.sleep(1)
+    # 记录1号楼起始位置
+    loc_flag = 1
+    loc = my_car.get_odometry(True)
+
+    for i, order in enumerate(order_list):
+        my_car.move_to_position(loc)
+        if order["address"] > loc_flag:
+            my_car.lane_dis_offset(speed=0.3, dis_hold=0.56)
+            loc_flag = 2
+            loc = my_car.get_odometry(True)
+        time.sleep(0.5)
+
+        # 调节识别高度
+        my_car.arm.move_y_position(0.13)
+        my_car.arm.move_y_position(0.13)
+        my_car.arm.move_x_position(0.3)
+        my_car.arm.move_x_position(0.3)
+        my_car.arm.set_arm_pose(arm="LEFT", hand='UP')
+        my_car.arm.set_arm_pose(arm="LEFT", hand='UP')
+
+        _x, y = find_name(order["name"])
+        my_car.arm.set_arm_pose(arm="RIGHT", hand="DOWN")
+        my_car.arm.set_arm_pose(arm="RIGHT", hand="DOWN")
+        my_car.arm.move_x_position(0.0)
+        my_car.arm.move_x_position(0.0)
+        my_car.arm.grasp(True)
+        my_car.arm.grasp(True)
+        my_car.arm.move_y_position(0.135 - i * 0.05)
+        my_car.arm.move_y_position(0.135 - i * 0.05)
+        my_car.arm.move_y_position(0.155 - i * 0.05)
+        my_car.arm.move_y_position(0.155 - i * 0.05)
+        my_car.arm.move_x_position(0.2)
+        my_car.arm.move_x_position(0.2)
+        my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+        my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+        my_car.arm.move_y_position(y * 0.09)
+        my_car.arm.move_y_position(y * 0.09)
+        my_car.arm.move_x_position(0.1)
+        my_car.arm.move_x_position(0.1)
+        my_car.arm.grasp(False)
+        my_car.arm.grasp(False)
+        time.sleep(1)
+        my_car.arm.move_x_position(0.15)
+        my_car.arm.move_x_position(0.15)
+        my_car.arm.set_arm_pose(arm="LEFT", hand=-80)
+        my_car.arm.set_arm_pose(arm="LEFT", hand=-80)
+        time.sleep(0.5)
+        my_car.arm.move_x_position(0.2)
+        my_car.arm.move_x_position(0.2)
+    
+    if loc_flag == 1:
+        my_car.lane_dis_offset(speed=0.3, dis_hold=1.7)
+    else:
+        my_car.lane_dis_offset(speed=0.3, dis_hold=1.1)
+
+
+def calibrate_suction_offset(label="cylinder_1", arm_side="LEFT", duration=20.0):
+    """
+    标定吸盘与摄像头的偏移量（delta_x, delta_y）。
+
+    使用方法：
+        1. 手动将小车开到圆柱体附近，机械臂吸盘对准目标
+        2. 运行此函数，观察实时打印的 dx, dy 值
+        3. 记录吸盘对准目标时的 (dx, dy)，作为 move_to_detection_target() 的 delta_x, delta_y
+        4. 按 Ctrl+C 或等待超时结束
+
+    参数:
+        label: 要标定的目标标签，如 "cylinder_1"
+        arm_side: 机械臂方向 "LEFT" 或 "RIGHT"
+        duration: 标定持续时长（秒）
+    """
+    my_car.arm.set_arm_angle(arm_side)
+    my_car.arm.set_arm_angle(arm_side)
+    my_car.arm.set_hand_angle("DOWN")
+    my_car.arm.set_hand_angle("DOWN")
+    my_car.arm.move_y_position(0.15)
+    my_car.arm.move_y_position(0.15)
+
+    print(f"\n{'='*60}")
+    print(f"  吸盘偏移量标定")
+    print(f"  目标: {label}  |  机械臂: {arm_side}")
+    print(f"  请手动将吸盘对准目标，观察下方实时数据")
+    print(f"  记录吸盘对准时的 (dx, dy) 值")
+    print(f"{'='*60}\n")
+
+    time_stop = time.time() + duration
+    last_dx, last_dy = 0.0, 0.0
+
+    while time.time() < time_stop:
+        dets = my_car.get_detection_results()
+        if label is not None:
+            dets = [item for item in dets if item[2] == label]
+
+        if len(dets) > 0:
+            det = dets[0]
+            _, _, det_label, score, dx, dy, w, h = det
+            last_dx, last_dy = dx, dy
+            bar_x = "█" * int(abs(dx) * 40) if abs(dx) < 0.5 else "█" * 20
+            bar_y = "█" * int(abs(dy) * 40) if abs(dy) < 0.5 else "█" * 20
+            print(f"\r  [{det_label}]  dx={dx:+.4f} {bar_x}  dy={dy:+.4f} {bar_y}  score={score:.2f}  ",
+                  end="", flush=True)
+        else:
+            print(f"\r  未检测到 {label}，请调整位置...                         ",
+                  end="", flush=True)
+
+        time.sleep(0.1)
+
+    print(f"\n\n  最终记录的偏移量:  delta_x={last_dx:+.4f}  delta_y={last_dy:+.4f}")
+    print(f"  请在调用 move_to_detection_target() 时传入这两个值\n")
+    return last_dx, last_dy
+
+
+def auto_seeding_1():
+
+    x_length = 0.5         # 基地前方转角的位置
+    heading = math.pi / 4   # 车子的方向 45°
+    sin45 = math.sin(heading)
+
+    # ---- 种子预设点 (dis=0.65) ----
+    dis_seed = 0.53
+    seed_loc = {
+        "cylinder_3": [x_length + dis_seed * sin45, dis_seed * sin45, heading],
+        "cylinder_2": [x_length + (dis_seed + 0.15) * sin45, (dis_seed + 0.16) * sin45, heading],
+        "cylinder_1": [x_length + (dis_seed + 0.25) * sin45, (dis_seed + 0.29) * sin45, heading],
+    }
+
+    # ---- 播种点预设位置 (dis=0.60) ----
+    dis_plant = 0.54
+    plant_loc = {
+        "cylinder_1": [x_length + dis_plant* sin45, dis_plant * sin45, heading],
+        "cylinder_2": [x_length + (dis_plant + 0.15) * sin45, (dis_plant + 0.15) * sin45, heading],
+        "cylinder_3": [x_length + (dis_plant + 0.3) * sin45, (dis_plant + 0.31) * sin45, heading],
+    }
+
+    cylinder_list = ["cylinder_3", "cylinder_2", "cylinder_1"]
+
+    # ---- 机械臂放置偏移量（左侧放种子） ----
+    ARM_PLACE_OFFSET = {
+        "cylinder_1": 0.07,
+        "cylinder_2": 0.055,
+        "cylinder_3": 0.07,
+    }
+
+    # 设置机械臂初始状态（左侧，识别播种点）
+    home_pose = my_car.get_odometry()  # 保存初始位置，任务结束后返回
+    print(f"巡线停止的位置：{home_pose}")
+
+    # ---- 第一阶段：识别播种点，每记录一个往前走0.02 ----
+    # 直接使用播种预设位置
+    cylinder_set_list = {
+        label: plant_loc[label] + [0.0] for label in cylinder_list
+    }
+    print("播种预设位置：")
+    print(cylinder_set_list)
+
+    # ---- 第二阶段：用种子预设位置 抓取种子 → 放到播种点 ----
+    for i in range(3):
+        # 移动手臂到右侧高处
+        my_car.arm.move_y_position(0.1)
+        my_car.arm.move_y_position(0.1)
+        my_car.arm.move_x_position(0.3)
+        my_car.arm.move_x_position(0.3)
+        my_car.arm.set_arm_pose(arm="RIGHT")
+        my_car.arm.set_arm_pose(arm="RIGHT")
+        my_car.arm.set_hand_angle("DOWN")
+        my_car.arm.set_hand_angle("DOWN")
+        # 移动到种子的理论位置，然后识别右侧的"种子"
+        my_car.move_to_position(seed_loc[cylinder_list[i]],max_velocities=(0.08, 0.08, math.pi / 8))
+        cls_id, label= my_car.move_to_detection_target(time_out=10.0)
+        my_car.beep()
+
+        # 获取预设好的播种位置（底盘位置 + 机械臂x）
+        if label not in cylinder_set_list:
+            print(f"警告：识别到非目标 {label}，跳过")
+            continue
+        pose = cylinder_set_list[label]
+        # 识别完成后不再横向调整机械臂，直接下降吸起种子
+        my_car.arm.grasp(False)
+        my_car.arm.grasp(False)
+        my_car.arm.move_y_position(0.002)
+        my_car.arm.move_y_position(0.002)
+        my_car.arm.move_y_position(0.2)
+        my_car.arm.move_y_position(0.2)
+
+        # 移动到左侧播种位置
+        my_car.arm.move_x_position(pose[3])       # 机械臂移动到记录的x位置
+        my_car.arm.move_x_position(pose[3])       # 机械臂移动到记录的x位置
+        my_car.arm.set_arm_pose(arm="LEFT")
+        my_car.arm.set_arm_pose(arm="LEFT")
+        my_car.arm.move_x_position(0.03)
+        my_car.arm.move_x_position(0.03)
+        my_car.move_to_position(pose[:3],max_velocities=(0.08, 0.08, math.pi / 8))        
+        #my_car.adjust_arm_position()
+        # 用标签查找机械臂放置偏移（左侧）
+        arm_place_offset = ARM_PLACE_OFFSET.get(label, 0.03)
+        print(f"  机械臂放置偏移: {arm_place_offset:.3f}m (label={label})")
+        my_car.arm.move_x_position(arm_place_offset)
+        my_car.arm.move_x_position(arm_place_offset)
+        #my_car.move_for([-0.05,0.0,0.0])
+        my_car.arm.move_y_position(0.03)
+        my_car.arm.move_y_position(0.03)
+        # my_car.move_for([0.025, 0.0, 0.0])
+        my_car.arm.grasp(True)
+        my_car.arm.grasp(True)
+
+    # 收尾动作
+    my_car.arm.move_y_position(0.1)
+    my_car.arm.move_y_position(0.1)
+    my_car.arm.set_arm_pose(hand="UP")
+    my_car.arm.set_arm_pose(hand="UP")
+    my_car.arm.move_x_position(0.15)
+    my_car.arm.move_x_position(0.15)
+    print("播种完成")
+
+    # 返回初始位置
+    print(f"返回初始位置：{home_pose}")
+    my_car.move_to_position(home_pose[:3], max_velocities=(0.08, 0.08, math.pi / 8))
+
+    my_car.beep()
+    my_car.beep()
+    my_car.get_odometry(True)
+    my_car.get_distance(True)
+    
+def auto_seeding_2():
+    x_length = 0.42  # 基地前方转角的位置，用于计算播种位置
+    dis = 0.55  # 转角后第一个播种点的距离
+    heading = math.pi / 4  # 车子的方向 45°
+    sin45 = math.sin(heading)  # sin45°
+    # 正对播种点车子的理论位置
+    cylinder_loc = {
+            "cylinder_3": [x_length + dis * sin45, (dis-0.15) * sin45, heading],
+            "cylinder_2": [x_length + (dis + 0.15) * sin45, (dis + 0.145) * sin45, heading],
+            "cylinder_1": [x_length + (dis + 0.3) * sin45, (dis + 0.295) * sin45, heading],
+    }
+    cylinder_list = ["cylinder_3", "cylinder_2", "cylinder_1"]
+    #记录种植的顺序
+    cylinder_set= ["cylinder_1","cylinder_2","cylinder_3"]
+    cylinder_set_list = {}
+    
+    # 设置机械臂初始状态：4个动作分别控制不同电机/舵机，后台同时进行，不阻塞底盘移动
+    arm_init_threads = [
+        threading.Thread(target=my_car.arm.move_y_position, args=(0.1,), daemon=True),
+        threading.Thread(target=my_car.arm.move_y_position, args=(0.1,), daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position, args=(0.0,), daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position, args=(0.0,), daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle, args=("LEFT",), daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle, args=("LEFT",), daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle, args=("DOWN",), daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle, args=("DOWN",), daemon=True)
+    ]
+    for _t in arm_init_threads:
+        _t.start()
+
+    print(f"巡线停止的位置：{my_car.get_odometry()}")
+    # 记录种植点位置：只实测第一个（cylinder_3），剩下两个沿45°方向按0.15m间隔计算得到
+    my_car.move_to_position(cylinder_loc[cylinder_list[0]],lateral_enabled=False)
+    for _t in arm_init_threads:
+        _t.join()   # 机械臂就位后再识别，避免和识别抢机械臂
+    
+    my_car.move_to_detection_target(time_out=10.0)
+    x, y, z = my_car.get_odometry()
+    first_pose = [x, y, z, my_car.arm.x_get_position()]
+    first_pose = [x, y, z, my_car.arm.x_get_position()]
+    print(f"第0个播种位置{first_pose}")
+    cylinder_set_list[cylinder_set[0]] = first_pose
+    my_car.beep()
+    
+    # 剩余播种点距第一个点（cylinder_3）的距离：cylinder_2=0.143m，cylinder_1=0.30m（均沿45°斜线方向）
+    for i, offset in zip(range(1, 3), [0.143, 0.30]):
+        calc_pose = [
+            first_pose[0] + offset * sin45,
+            first_pose[1] + offset * sin45,
+            first_pose[2],
+            first_pose[3],
+        ]
+        print(f"第{i}个播种位置(计算){calc_pose}")
+
+        cylinder_set_list[cylinder_set[i]] = calc_pose
+
+    print("实际播种位置：")
+    print(cylinder_set_list)
+    
+    for i in range(3):
+        # 移动手臂到右侧高处
+        arm_move_list=[
+            threading.Thread(target=my_car.arm.move_y_position,args=(0.1,),daemon=True),
+            threading.Thread(target=my_car.arm.move_y_position,args=(0.1,),daemon=True),
+            threading.Thread(target=my_car.arm.move_x_position,args=(0.3,),daemon=True),
+            threading.Thread(target=my_car.arm.move_x_position,args=(0.3,),daemon=True),
+            threading.Thread(target=my_car.arm.set_arm_angle,args=("RIGHT",),daemon=True),
+            threading.Thread(target=my_car.arm.set_arm_angle,args=("RIGHT",),daemon=True)
+        ]    
+        for _t in arm_move_list:
+            _t.start()
+        # my_car.arm.move_y_position(0.1)
+        # my_car.arm.move_x_position(0.3)
+        # my_car.arm.set_arm_pose(arm="RIGHT")
+        # 对齐目标，识别
+        my_car.move_to_position(cylinder_loc[cylinder_list[i]],lateral_enabled=False)
+        for _t in arm_move_list:
+            _t.join()
+
+        time.sleep(0.5)
+        cls_id, label= my_car.move_to_detection_target(time_out=10.0)
+        print(f"识别到目标{cls_id}-{label}")
+        if label not in cylinder_set_list:
+            print(f"[警告] 识别到非目标 {label}，跳过本次")
+            continue
+        my_car.beep()
+        pose = cylinder_set_list[label]
+    
+        # 调整气泵吸嘴对齐目标（cylinder_1 用 0.03，其余用 0.02）
+        dis_adj = 0.04 if label == "cylinder_1" else 0.02
+        my_car.adjust_arm_position(dis=dis_adj)
+        # 吸起目标
+        my_car.arm.grasp(False)
+        my_car.arm.grasp(False)
+        my_car.arm.move_y_position(0.01)
+        my_car.arm.move_y_position(0.01)
+        time.sleep(0.5)
+        my_car.arm.move_y_position(0.2)
+        my_car.arm.move_y_position(0.2)
+    
+        # 移动到目标播种处
+        arm_move_list=[
+          threading.Thread(target=my_car.arm.move_x_position,args=(pose[3],),daemon=True),
+          threading.Thread(target=my_car.arm.move_x_position,args=(pose[3],),daemon=True),
+          threading.Thread(target=my_car.arm.set_arm_pose,kwargs={"arm": "LEFT"},daemon=True),
+          threading.Thread(target=my_car.arm.set_arm_pose,kwargs={"arm": "LEFT"},daemon=True)
+        ]
+        for _t in arm_move_list:
+            _t.start()
+        # my_car.arm.move_x_position(pose[3])
+        # my_car.arm.set_arm_pose(arm="LEFT")
+        my_car.move_to_position(pose[:3],lateral_enabled=False)
+        for _t in arm_move_list:
+            _t.join()
+
+        my_car.adjust_arm_position(dis=0.03)
+        my_car.arm.move_y_position(0.04)
+        my_car.arm.move_y_position(0.04)
+        my_car.arm.grasp(True)
+        my_car.arm.grasp(True)
+        my_car.arm.move_y_position(0.1)
+        my_car.arm.move_y_position(0.1)
+    # 移动手臂到右侧高处
+    arm_move_list=[
+        threading.Thread(target=my_car.arm.move_y_position,args=(0.1,),daemon=True),
+        threading.Thread(target=my_car.arm.move_y_position,args=(0.1,),daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_pose,kwargs={"hand": "UP"},daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_pose,kwargs={"hand": "UP"},daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position,args=(0.15,),daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position,args=(0.15,),daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle,args=("RIGHT",),daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle,args=("RIGHT",),daemon=True)
+    ]    
+    for _t in arm_move_list:
+        _t.start()
+    my_car.move_to_position(cylinder_loc[cylinder_list[0]],lateral_enabled=False)
+
+    # for _t in arm_move_list:
+        # _t.join()#完成机械臂线程
+    time.sleep(0.5)
+    print("播种完成")
+    my_car.beep()
+    my_car.beep()
+    my_car.get_odometry(True)
+    my_car.get_distance(True)
+
+
+
+
+def record_detection_pose_with_retry(my_car, max_retry=3):
+    """
+    带有重试机制的水块识别函数
+    如果在当前位置没有看到水块，底盘微调前进并重试。
+    """
+    for attempt in range(max_retry):
+        time.sleep(1.0)
+        dets = my_car.get_detection_results()
+        if len(dets) > 0:
+            cls_id, label, _ = my_car.move_to_detection_target_v2(time_out=4.0)
+            pose = [*my_car.get_odometry(), my_car.arm.x_get_position()]
+            pose = [*my_car.get_odometry(), my_car.arm.x_get_position()]
+            my_car.beep()
+            return pose, label
+            
+        print(f"未检测到水块，第 {attempt+1} 次微调重试...")
+        my_car.lane_dis_offset(speed=0.3, dis_hold=0.05)
+        
+    raise RuntimeError("水块位置识别失败，请检查水块摆放")
+
+
+def water_tower_task_3():
+    water_num = {"water_l1": 1,"water_l2": 2, "water_l3": 3}  # 标签对应水量
+    tower_water = []
+    water_loction = []
+    tower_loction = {}
+    my_car.arm.move_y_position(0.15)
+    my_car.arm.move_x_position(0.0)
+    # 先转到左边识别水块
+    my_car.arm.set_arm_angle("LEFT")
+    my_car.arm.set_hand_angle("DOWN")
+    time.sleep(0.5)
+    my_car.move_to_wt3(time_out=10.0, delta_x=0.0, delta_y=0.0, x_thr=0.1, y_thr=0.1, use_hsv=True, save_images=0)
+    # 再转到右边识别水塔
+    my_car.arm.set_arm_angle("RIGHT")
+    my_car.arm.set_hand_angle("MID")
+    my_car.arm.move_y_position(0.0)
+    my_car.arm.move_x_position(0.14)
+    time.sleep(0.5)
+    cls_id, label = my_car.move_to_detection_target(time_out=1.0)
+    tower_water.append(label)
+    print(f"识别到目标{cls_id}-{label},第一个水塔")
+    my_car.beep()
+    x, y, z = my_car.get_odometry()
+    pos1 = [x, y , z]                 
+    tower_loction[label] = [x, y , z, 0.0]  # 水塔1记录位置(+0.02)
+    # my_car.lane_dis_offset(speed=0.05, dis_hold=0.2,mode=1)
+    # my_car.move_for([0.46,0.0,0.0])
+    my_car.move_distance([0.2,0,0], dis=0.62)
+    # my_car.lane_dis_offset(speed=0.3, dis_hold=0.58)
+    # 调整位置识别第二个水塔
+    # time.sleep(0.5)
+    cls_id, label = my_car.move_to_detection_target(time_out=1.0)
+    tower_water.append(label)
+    print(f"识别到目标{cls_id}-{label},第二个水塔")
+    my_car.beep()
+    pos2 = my_car.get_odometry()             # [x, y, z]
+
+    # 第三组水块 = 水塔2位置（后退0.01）
+    tower_loction[label] = [pos2[0] , pos2[1], pos2[2], 0.0]
+
+    # 第二组水块 = 第一组和第三组的中间
+    pos_mid = [(pos1[0]+pos2[0])/2, (pos1[1]+pos2[1])/2, (pos1[2]+pos2[2])/2]
+
+    # 三组水块，每组两个，共6个。arm: [0][2][4]=0.08, [1][3][5]=0.01
+    p1, p2, pm = list(pos1), list(pos2), list(pos_mid)
+    water_loction = [
+        p1 + [0.1],   p1 + [0.05],     # 组1: [0][1]
+        pm + [0.1],   pm + [0.02],     # 组2: [2][3]
+        p2 + [0.15],   p2 + [0.02],     # 组3: [4][5]
+    ]
+
+    print("------------------水塔任务记录------------------")
+    print(f"水塔识别结果：{tower_water}")
+    print(f"水块位置：")
+    print(*water_loction, sep="\n")
+    print(f"水塔位置：{tower_loction}")
+    print("----------------------------------------------")
+    print("-------------------开始执行--------------------")
+    # 先执行第二个水塔，
+    for i, label in enumerate(reversed(tower_water)):
+        water_num_ = water_num[label]
+        print(f"当前水塔{label}，需要浇水{water_num_}次")
+        for j in range(water_num_):
+            # 移动到水块位置
+            my_car.arm.move_y_position(0.15)
+            my_car.arm.move_x_position(0.0)
+            my_car.arm.set_arm_angle("LEFT")
+            time.sleep(0.2)
+            my_car.arm.set_arm_angle("LEFT")
+            my_car.arm.set_arm_angle("LEFT")
+            my_car.arm.set_hand_angle("DOWN")
+            idx = -(j + 1) if i == 0 else j
+
+            # j==1: 与首个水块同一条线，跳过视觉识别
+            my_car.move_to_position(water_loction[idx][0:3],lateral_enabled=False)
+
+            my_car.arm.move_x_position(water_loction[idx][3])
+            time.sleep(0.5)
+            # j==1: 跳过视觉识别，直接抓取
+            err_x = getattr(my_car, '_last_err_x', 0.0)
+            if j != 1:
+                my_car.move_to_wt3(time_out=6.0, delta_x=-0.02, delta_y=0.0,
+                    x_thr=0.02, y_thr=0.1, lock_thr=0.015, use_hsv=True, save_images=1)
+                wt3_result = getattr(my_car, "last_wt3_result", {})
+
+                # 人工/系统停止必须终止任务
+                if wt3_result.get("reason") == "stopped" or getattr(my_car, "_stop_flag", False):
+                    my_car.set_velocity(0, 0, 0)
+                    my_car.arm.x_speed(0)
+                    return
+
+                # 普通视觉超时：按任务规则继续抓取，但记录警告
+                if wt3_result.get("timed_out"):
+                    print(
+                        "[WARN] 水块视觉对准超时，按任务规则使用最后有效位置继续抓取 | "
+                        f"reason={wt3_result.get('reason')} "
+                        f"err_x={wt3_result.get('error_x')} "
+                        f"seq={wt3_result.get('frame_seq')}"
+                    )
+
+                err_x = wt3_result.get("error_x")
+                if err_x is None:
+                    err_x = getattr(my_car, "_last_err_x", 0.0)
+                my_car.adjust_arm_position(0.05)
+                # 用水块实际位置更新水塔/水块位置（仅水块0和水块5）
+                if idx == 0:  # 水块0 → 水塔1 和 水块1
+                    x, y, z = my_car.get_odometry()
+                    tower_loction[tower_water[0]] = [x, y, z, 0.0]
+                    water_loction[1][0:3] = [x, y, z]  # 水块0实际位置替换水块1位置（保留arm_x）
+                    print(f"[位置更新] 水块0实际位置替代水塔{tower_water[0]}和水块1: [{x:.4f}, {y:.4f}, {z:.4f}]")
+                elif idx == -1:  # 水块5 → 水塔2 和 水块4
+                    x, y, z = my_car.get_odometry()
+                    tower_loction[tower_water[1]] = [x, y, z, 0.0]
+                    water_loction[4][0:3] = [x, y, z]  # 水块5实际位置替换水块4位置（保留arm_x）
+                    print(f"[位置更新] 水块5实际位置替代水塔{tower_water[1]}和水块4: [{x:.4f}, {y:.4f}, {z:.4f}]")
+            # 吸水
+            my_car.arm.grasp(False)
+            my_car.arm.move_y_position(0.06)
+            my_car.arm.move_y_position(0.2)
+            # 4号水块arm_x=0.18伸出较多，收臂不要太深避免碰撞
+            is_block4 = (i == 0 and j == 1)
+            print(f"[DEBUG] i={i} j={j} idx={idx} is_block4={is_block4} arm_x_before={my_car.arm.x_get_position():.3f} err_x={err_x:+.4f}")
+            my_car.arm.move_x_position(0.07 if is_block4 else 0.01)
+            # err_x加权修正舵机角度，正负都生效
+            ANGLE_BASE = -91
+            ANGLE_COEFF = 0  # 负系数，err_x>0角度更负，err_x<0角度回正
+            arm_angle = int(ANGLE_BASE + err_x * ANGLE_COEFF)
+            my_car.arm.set_arm_angle(arm_angle)
+            time.sleep(0.2)
+            my_car.arm.set_arm_angle(arm_angle)
+            my_car.arm.set_arm_angle(arm_angle)
+            print(f"[臂角度] err_x={err_x:+.4f} → angle={arm_angle:.1f}")
+            my_car.arm.set_hand_angle("UP")
+
+            # 里程计回退到水塔位置
+            my_car.pid_x.reset()
+            my_car.pid_y.reset()
+            my_car.pid_yaw.reset()
+            my_car.move_to_position(tower_loction[label][0:3], lateral_enabled=False)
+            my_car.arm.move_y_position(0.01 + 0.055 * j - (0.01 if water_num_ == 3 and j == 2 else 0))
+            # my_car.move_to_detection_target_wt3(time_out=20.0)
+            # my_car.move_distance([0.15,0,0], dis=0.01)  # 固定往前再走0.015
+            my_car.arm.move_x_position(0.22)
+            my_car.arm.grasp(True)
+            time.sleep(0.5)
+            # 4号水块放置后也不要收太深
+            post_place_x = 0.1 if (i == 0 and j == 1) else 0.15
+            my_car.arm.move_x_position(post_place_x)
+            my_car.arm.move_x_position(0.08 if (i == 0 and j == 1) else 0.01)
+
+
+def water_tower_task_4():
+    water_num = {"water_l1": 1,"water_l2": 2, "water_l3": 3}  # 标签对应水量
+    tower_water = []
+    water_loction = []
+    tower_loction = {}
+    arm_move_list=[
+        threading.Thread(target=my_car.arm.move_y_position,args=(0.15,),daemon=True),
+        threading.Thread(target=my_car.arm.move_y_position,args=(0.15,),daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position,args=(0.0,),daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position,args=(0.0,),daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle,args=("LEFT",),daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle,args=("LEFT",),daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle,args=("DOWN",),daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle,args=("DOWN",),daemon=True)
+
+    ]    
+    for _t in arm_move_list:
+        _t.start()
+    
+    for _t in arm_move_list:
+        _t.join()
+    # my_car.arm.move_y_position(0.15)
+    # my_car.arm.move_x_position(0.0)
+    # # 先转到左边识别水块
+    # my_car.arm.set_arm_angle("LEFT")
+    # my_car.arm.set_hand_angle("DOWN")
+    time.sleep(0.5)
+    my_car.move_to_wt3(time_out=10.0, delta_x=0.0, delta_y=0.0, x_thr=0.1, y_thr=0.1, use_hsv=True, save_images=0)
+    # 再转到右边识别水塔
+    my_car.arm.set_arm_angle("RIGHT")
+    my_car.arm.set_arm_angle("RIGHT")
+    my_car.arm.set_hand_angle("MID")
+    my_car.arm.set_hand_angle("MID")
+    my_car.arm.move_y_position(0.0)
+    my_car.arm.move_y_position(0.0)
+    my_car.arm.move_x_position(0.14)
+    my_car.arm.move_x_position(0.14)
+    time.sleep(0.5)
+    cls_id, label = my_car.move_to_detection_target(time_out=1.0)
+    tower_water.append(label)
+    print(f"识别到目标{cls_id}-{label},第一个水塔")
+    my_car.beep()
+    x, y, z = my_car.get_odometry()
+    pos1 = [x, y , z]                 
+    tower_loction[label] = [x, y , z, 0.0]  # 水塔1记录位置(+0.02)
+    # my_car.lane_dis_offset(speed=0.05, dis_hold=0.2,mode=1)
+    # my_car.move_for([0.46,0.0,0.0])
+    my_car.move_distance([0.2,0,0], dis=0.66)
+    # my_car.lane_dis_offset(speed=0.3, dis_hold=0.58)
+    # 调整位置识别第二个水塔
+    # time.sleep(0.5)
+    cls_id, label = my_car.move_to_detection_target(time_out=1.0)
+    tower_water.append(label)
+    print(f"识别到目标{cls_id}-{label},第二个水塔")
+    my_car.beep()
+    pos2 = my_car.get_odometry()             # [x, y, z]
+
+    # 第三组水块 = 水塔2位置（后退0.01）
+    tower_loction[label] = [pos2[0] , pos2[1], pos2[2], 0.0]
+
+    # 第二组水块 = 第一组和第三组的中间
+    pos_mid = [(pos1[0]+pos2[0])/2, (pos1[1]+pos2[1])/2, (pos1[2]+pos2[2])/2]
+
+    # 三组水块，每组两个，共6个。arm: [0][2][4]=0.08, [1][3][5]=0.01
+    p1, p2, pm = list(pos1), list(pos2), list(pos_mid)
+    water_loction = [
+        p1 + [0.1],   p1 + [0.05],     # 组1: [0][1]
+        pm + [0.1],   pm + [0.02],     # 组2: [2][3]
+        p2 + [0.15],   p2 + [0.02],     # 组3: [4][5]
+    ]
+
+    print("------------------水塔任务记录------------------")
+    print(f"水塔识别结果：{tower_water}")
+    print(f"水块位置：")
+    print(*water_loction, sep="\n")
+    print(f"水塔位置：{tower_loction}")
+    print("----------------------------------------------")
+    print("-------------------开始执行--------------------")
+    # 先执行第二个水塔，
+    for i, label in enumerate(reversed(tower_water)):
+        water_num_ = water_num[label]
+        print(f"当前水塔{label}，需要浇水{water_num_}次")
+        for j in range(water_num_):
+            # 移动到水块位置
+            my_car.arm.move_y_position(0.15)
+            my_car.arm.move_y_position(0.15)
+            my_car.arm.move_x_position(0.0)
+            my_car.arm.move_x_position(0.0)
+            my_car.arm.set_arm_angle("LEFT")
+            my_car.arm.set_arm_angle("LEFT")
+            my_car.arm.set_hand_angle("DOWN")
+            my_car.arm.set_hand_angle("DOWN")
+            idx = -(j + 1) if i == 0 else j
+
+            # j==1: 与首个水块同一条线，跳过视觉识别
+            my_car.move_to_position(water_loction[idx][0:3],lateral_enabled=False)
+
+            my_car.arm.move_x_position(water_loction[idx][3])
+            my_car.arm.move_x_position(water_loction[idx][3])
+            time.sleep(0.5)
+            # j==1: 跳过视觉识别，直接抓取
+            err_x = getattr(my_car, '_last_err_x', 0.0)
+            if j != 1:
+                my_car.move_to_wt3(time_out=12.0, delta_x=-0.02, delta_y=0.0,
+                    x_thr=0.02, y_thr=0.1, lock_thr=0.015, use_hsv=True, save_images=0)
+                wt3_result = getattr(my_car, "last_wt3_result", {})
+
+                # 人工/系统停止必须终止任务
+                if wt3_result.get("reason") == "stopped" or getattr(my_car, "_stop_flag", False):
+                    my_car.set_velocity(0, 0, 0)
+                    my_car.arm.x_speed(0)
+                    my_car.arm.x_speed(0)
+                    return
+
+                # 普通视觉超时：按任务规则继续抓取，但记录警告
+                if wt3_result.get("timed_out"):
+                    print(
+                        "[WARN] 水块视觉对准超时，按任务规则使用最后有效位置继续抓取 | "
+                        f"reason={wt3_result.get('reason')} "
+                        f"err_x={wt3_result.get('error_x')} "
+                        f"seq={wt3_result.get('frame_seq')}"
+                    )
+
+                err_x = wt3_result.get("error_x")
+                if err_x is None:
+                    err_x = getattr(my_car, "_last_err_x", 0.0)
+                my_car.adjust_arm_position(0.05)
+            # 吸水
+            my_car.arm.grasp(False)
+            my_car.arm.grasp(False)
+            my_car.arm.move_y_position(0.06)
+            my_car.arm.move_y_position(0.06)
+            my_car.arm.move_y_position(0.2)
+            my_car.arm.move_y_position(0.2)
+            # 4号水块arm_x=0.18伸出较多，收臂不要太深避免碰撞
+            is_block4 = (i == 0 and j == 1)
+            print(f"[DEBUG] i={i} j={j} idx={idx} is_block4={is_block4} arm_x_before={my_car.arm.x_get_position():.3f} err_x={err_x:+.4f}")
+            print(f"[DEBUG] i={i} j={j} idx={idx} is_block4={is_block4} arm_x_before={my_car.arm.x_get_position():.3f} err_x={err_x:+.4f}")
+            my_car.arm.move_x_position(0.07 if is_block4 else 0.01)
+            my_car.arm.move_x_position(0.07 if is_block4 else 0.01)
+            # err_x加权修正舵机角度，正负都生效
+            ANGLE_BASE = -93
+            ANGLE_COEFF = 0  # 负系数，err_x>0角度更负，err_x<0角度回正
+            arm_angle = int(ANGLE_BASE + err_x * ANGLE_COEFF)
+            my_car.arm.set_arm_angle(arm_angle)
+            my_car.arm.set_arm_angle(arm_angle)
+            print(f"[臂角度] err_x={err_x:+.4f} → angle={arm_angle:.1f}")
+            my_car.arm.set_hand_angle("UP")
+            my_car.arm.set_hand_angle("UP")
+
+            # 里程计回退到水塔位置
+            my_car.pid_x.reset()
+            my_car.pid_y.reset()
+            my_car.pid_yaw.reset()
+            my_car.move_to_position(tower_loction[label][0:3], lateral_enabled=False)
+            my_car.arm.move_y_position(0.01 + 0.055 * j - (0.01 if water_num_ == 3 and j == 2 else 0))
+            my_car.arm.move_y_position(0.01 + 0.055 * j - (0.01 if water_num_ == 3 and j == 2 else 0))
+            # my_car.move_to_detection_target_wt3(time_out=20.0)
+            # my_car.move_distance([0.15,0,0], dis=0.01)  # 固定往前再走0.015
+            my_car.arm.move_x_position(0.22)
+            my_car.arm.move_x_position(0.22)
+            my_car.arm.grasp(True)
+            my_car.arm.grasp(True)
+            time.sleep(0.5)
+            # 4号水块放置后也不要收太深
+            post_place_x = 0.1 if (i == 0 and j == 1) else 0.15
+            my_car.arm.move_x_position(post_place_x)
+            my_car.arm.move_x_position(post_place_x)
+            my_car.arm.move_x_position(0.08 if (i == 0 and j == 1) else 0.01)
+            my_car.arm.move_x_position(0.08 if (i == 0 and j == 1) else 0.01)
+
+
+def water_tower_task_5():
+    water_num = {"water_l1": 1,"water_l2": 2, "water_l3": 3}  # 标签对应水量
+    tower_water = []
+    water_loction = []
+    tower_loction = {}
+    # 水塔识别拍照：保存检测同帧到 water_pic/
+    water_pic_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "water_pic")
+    os.makedirs(water_pic_dir, exist_ok=True)
+
+    def _capture_water_tower_image(filename):
+        frame = getattr(my_car, "_last_det_img", None)
+        if frame is None:
+            print(f"[WARN] 水塔拍照失败（无检测帧）：{filename}")
+            return
+        path = os.path.join(water_pic_dir, filename)
+        cv2.imwrite(path, frame.copy())
+        print(f"[水塔拍照] 已保存: {path}")
+
+    my_car.arm.move_y_position(0.15)
+    my_car.arm.move_y_position(0.15)
+    arm_move_list=[
+        threading.Thread(target=my_car.arm.move_x_position,args=(0.0,),daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position,args=(0.0,),daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle,args=("LEFT",),daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle,args=("LEFT",),daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle,args=("DOWN",),daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle,args=("DOWN",),daemon=True)
+    ]    
+    for _t in arm_move_list:
+        _t.start()
+    for _t in arm_move_list:
+        _t.join()
+    
+    # my_car.arm.move_y_position(0.15)
+    # my_car.arm.move_x_position(0.0)
+    # # 先转到左边识别水块
+    # my_car.arm.set_arm_angle("LEFT")
+    # my_car.arm.set_hand_angle("DOWN")
+    time.sleep(0.5)
+    my_car.move_to_wt3(time_out=10.0, delta_x=0.0, delta_y=0.0, x_thr=0.1, y_thr=0.1, use_hsv=True, save_images=0)
+    home_pose = my_car.get_odometry()  # 记录 move_to_wt3 结束后的位置，水塔识别不足时任务结束后返回
+    # 再转到右边识别水塔
+
+    my_car.arm.set_arm_angle("RIGHT")
+    my_car.arm.set_arm_angle("RIGHT")
+    my_car.arm.set_hand_angle("MID")
+    my_car.arm.set_hand_angle("MID")
+    my_car.arm.move_y_position(0.0)
+    my_car.arm.move_y_position(0.0)
+    my_car.arm.move_x_position(0.14)
+    my_car.arm.move_x_position(0.14)
+    time.sleep(0.5)
+    cls_id, label = my_car.move_to_detection_target(time_out=1.0)
+    _capture_water_tower_image("water_tower_1.jpg")
+    tower_water.append(label)
+    print(f"识别到目标{cls_id}-{label},第一个水塔")
+    my_car.beep()
+    x, y, z = my_car.get_odometry()
+    pos1 = [x, y , z]                 
+    tower_loction[label] = [x, y , z, 0.0]  # 水塔1记录位置(+0.02)
+    # my_car.lane_dis_offset(speed=0.05, dis_hold=0.2,mode=1)
+    # my_car.move_for([0.46,0.0,0.0])
+    my_car.move_distance([0.2,0,0], dis=0.61)
+    # my_car.lane_dis_offset(speed=0.3, dis_hold=0.58)
+    # 调整位置识别第二个水塔
+    time.sleep(0.5)
+    cls_id, label = my_car.move_to_detection_target(time_out=1.0)
+    _capture_water_tower_image("water_tower_2.jpg")
+    tower_water.append(label)
+    print(f"识别到目标{cls_id}-{label},第二个水塔")
+    my_car.beep()
+    pos2 = my_car.get_odometry()             # [x, y, z]
+
+    # 第三组水块 = 水塔2位置（后退0.01）
+    tower_loction[label] = [pos2[0] , pos2[1], pos2[2], 0.0]
+
+    # 第二组水块 = 第一组和第三组的中间
+    pos_mid = [(pos1[0]+pos2[0])/2, (pos1[1]+pos2[1])/2, (pos1[2]+pos2[2])/2]
+
+    # 三组水块，每组两个，共6个。arm: [0][2][4]=0.08, [1][3][5]=0.01
+    p1, p2, pm = list(pos1), list(pos2), list(pos_mid)
+    water_loction = [
+        p1 + [0.1],   p1 + [0.05],     # 组1: [0][1]
+        pm + [0.1],   pm + [0.02],     # 组2: [2][3]
+        p2 + [0.15],   p2 + [0.02],     # 组3: [4][5]
+    ]
+
+    print("------------------水塔任务记录------------------")
+    print(f"水塔识别结果：{tower_water}")
+    print(f"水块位置：")
+    print(*water_loction, sep="\n")
+    print(f"水塔位置：{tower_loction}")
+    print("----------------------------------------------")
+    print("-------------------开始执行--------------------")
+    # 先执行第二个水塔，
+    for i, label in enumerate(reversed(tower_water)):
+        if label not in water_num:
+            print(f"[警告] 识别到无效水塔 {label}，跳过")
+            continue
+        water_num_ = water_num[label]
+        print(f"当前水塔{label}，需要浇水{water_num_}次")
+        for j in range(water_num_):
+            # 移动到水块位置
+            my_car.arm.move_y_position(0.15)
+            my_car.arm.move_y_position(0.15)
+            my_car.arm.move_x_position(0.0)
+            my_car.arm.move_x_position(0.0)
+            my_car.arm.set_arm_angle("LEFT")
+            my_car.arm.set_arm_angle("LEFT")
+            my_car.arm.set_hand_angle("DOWN")
+            my_car.arm.set_hand_angle("DOWN")
+            idx = -(j + 1) if i == 0 else j
+
+            # j==1: 与首个水块同一条线，跳过视觉识别
+            my_car.move_to_position(water_loction[idx][0:3],lateral_enabled=False)
+
+            my_car.arm.move_x_position(water_loction[idx][3])
+            my_car.arm.move_x_position(water_loction[idx][3])
+            time.sleep(0.5)
+            # j==1: 跳过视觉识别，直接抓取
+            err_x = getattr(my_car, '_last_err_x', 0.0)
+            if j != 1:
+                my_car.move_to_wt3(time_out=6.0, delta_x=-0.02, delta_y=0.0,
+                    x_thr=0.02, y_thr=0.1, lock_thr=0.015, use_hsv=True, save_images=1)
+                wt3_result = getattr(my_car, "last_wt3_result", {})
+
+                # 人工/系统停止必须终止任务
+                if wt3_result.get("reason") == "stopped" or getattr(my_car, "_stop_flag", False):
+                    my_car.set_velocity(0, 0, 0)
+                    my_car.arm.x_speed(0)
+                    my_car.arm.x_speed(0)
+                    return
+
+                # 普通视觉超时：按任务规则继续抓取，但记录警告
+                if wt3_result.get("timed_out"):
+                    print(
+                        "[WARN] 水块视觉对准超时，按任务规则使用最后有效位置继续抓取 | "
+                        f"reason={wt3_result.get('reason')} "
+                        f"err_x={wt3_result.get('error_x')} "
+                        f"seq={wt3_result.get('frame_seq')}"
+                    )
+
+                err_x = wt3_result.get("error_x")
+                if err_x is None:
+                    err_x = getattr(my_car, "_last_err_x", 0.0)
+                my_car.adjust_arm_position(0.05)
+                # 用水块实际位置更新水塔/水块位置（仅水块0和水块5）
+                if idx == 0:  # 水块0 → 水塔1 和 水块1
+                    x, y, z = my_car.get_odometry()
+                    tower_loction[tower_water[0]] = [x, y, z, 0.0]
+                    water_loction[1][0:3] = [x, y, z]  # 水块0实际位置替换水块1位置（保留arm_x）
+                    print(f"[位置更新] 水块0实际位置替代水塔{tower_water[0]}和水块1: [{x:.4f}, {y:.4f}, {z:.4f}]")
+                elif idx == -1:  # 水块5 → 水塔2 和 水块4
+                    x, y, z = my_car.get_odometry()
+                    tower_loction[tower_water[1]] = [x, y, z, 0.0]
+                    water_loction[4][0:3] = [x, y, z]  # 水块5实际位置替换水块4位置（保留arm_x）
+                    print(f"[位置更新] 水块5实际位置替代水塔{tower_water[1]}和水块4: [{x:.4f}, {y:.4f}, {z:.4f}]")
+            # 吸水
+            my_car.arm.grasp(False)
+            my_car.arm.grasp(False)
+            my_car.arm.move_y_position(0.06)
+            my_car.arm.move_y_position(0.06)
+            my_car.arm.move_y_position(0.2)
+            my_car.arm.move_y_position(0.2)
+            # 4号水块arm_x=0.18伸出较多，收臂不要太深避免碰撞
+            is_block4 = (i == 0 and j == 1)
+            print(f"[DEBUG] i={i} j={j} idx={idx} is_block4={is_block4} arm_x_before={my_car.arm.x_get_position():.3f} err_x={err_x:+.4f}")
+            print(f"[DEBUG] i={i} j={j} idx={idx} is_block4={is_block4} arm_x_before={my_car.arm.x_get_position():.3f} err_x={err_x:+.4f}")
+            my_car.arm.move_x_position(0.07 if is_block4 else 0.01)
+            my_car.arm.move_x_position(0.07 if is_block4 else 0.01)
+            # err_x加权修正舵机角度，正负都生效
+            ANGLE_BASE = -93
+            ANGLE_COEFF = 0  # 负系数，err_x>0角度更负，err_x<0角度回正
+            arm_angle = int(ANGLE_BASE + err_x * ANGLE_COEFF)
+            my_car.arm.set_arm_angle(arm_angle)
+            my_car.arm.set_arm_angle(arm_angle)
+            print(f"[臂角度] err_x={err_x:+.4f} → angle={arm_angle:.1f}")
+            my_car.arm.set_hand_angle("UP")
+            my_car.arm.set_hand_angle("UP")
+
+            # 里程计回退到水塔位置
+            my_car.pid_x.reset()
+            my_car.pid_y.reset()
+            my_car.pid_yaw.reset()
+            my_car.move_to_position(tower_loction[label][0:3], lateral_enabled=False)
+            my_car.arm.move_y_position(0.01 + 0.055 * j - (0.02 if water_num_ == 3 and j == 2 else 0))
+            my_car.arm.move_y_position(0.01 + 0.055 * j - (0.02 if water_num_ == 3 and j == 2 else 0))
+            # my_car.move_to_detection_target_wt3(time_out=20.0)
+            # my_car.move_distance([0.15,0,0], dis=0.01)  # 固定往前再走0.015
+            my_car.arm.move_x_position(0.22)
+            my_car.arm.move_x_position(0.22)
+            my_car.arm.grasp(True)
+            my_car.arm.grasp(True)
+            time.sleep(0.5)
+            # 4号水块放置后也不要收太深
+            post_place_x = 0.1 if (i == 0 and j == 1) else 0.15
+            my_car.arm.move_x_position(post_place_x)
+            my_car.arm.move_x_position(post_place_x)
+            my_car.arm.move_x_position(0.08 if (i == 0 and j == 1) else 0.01)
+            my_car.arm.move_x_position(0.08 if (i == 0 and j == 1) else 0.01)
+
+    # 保护：水塔识别不足（0 或 1 个）时，任务结束后返回初始位置，保证后续巡线能接上
+    valid_count = len([l for l in tower_water if l in water_num])
+    if valid_count <= 1:
+        print(f"[保护] 水塔识别不足（有效 {valid_count} 个），返回初始位置：{home_pose}")
+        my_car.move_to_position(home_pose[:3], max_velocities=(0.08, 0.08, math.pi / 8))
+
+
+def arm_dy_debug():
+    """
+    机械臂 dy → arm_x 比例关系调试工具。
+
+    功能：
+      - 自动进入检测姿态（机械臂 LEFT + DOWN）
+      - 持续识别目标，根据 dy 实时移动机械臂 x 轴
+      - 每 10 秒自动拍一张照片，dy 标注在照片上
+      - 按 Ctrl+C 退出，机械臂自动归位
+    """
+    import time as time_mod
+
+    ARM_BASE = 0.05
+    ARM_K    = 0.05
+    INTERVAL = 10  # 拍照间隔（秒）
+
+    print("=" * 60)
+    print("  机械臂 dy → arm_x 比例调试工具")
+    print("  公式: arm_x = ARM_BASE + ARM_K × dy")
+    print(f"  当前: ARM_BASE={ARM_BASE:.3f}, ARM_K={ARM_K:.1f}")
+    print(f"  每 {INTERVAL}s 自动拍照, 按 Ctrl+C 退出")
+    print("=" * 60)
+
+    # ---- 机械臂进入准备姿态 ----
+    print("  机械臂进入检测姿态...")
+    my_car.arm.move_y_position(0.14)
+    my_car.arm.move_y_position(0.14)
+    my_car.arm.move_x_position(0.02)
+    my_car.arm.move_x_position(0.02)
+    my_car.arm.set_arm_angle("LEFT")
+    my_car.arm.set_arm_angle("LEFT")
+    my_car.arm.set_hand_angle("DOWN")
+    my_car.arm.set_hand_angle("DOWN")
+    time_mod.sleep(1)
+    print("  准备就绪，开始检测...")
+    print("-" * 60)
+
+    last_shot = 0
+    last_arm_x = None  # 上一次的手臂位置，避免重复移动
+    try:
+        while True:
+            dets = my_car.get_detection_results()
+            if dets:
+                det = dets[0]  # 取最近的目标
+                cls_id, det_id, label, score, dx, dy, w, h = det
+                arm_x = ARM_BASE + ARM_K * dy
+                arm_x = max(0.0, min(0.30, arm_x))  # 限制在安全范围
+                bar = "✅" if 0.0 <= arm_x <= 0.30 else "⚠️"
+                print(f"  [{time_mod.strftime('%H:%M:%S')}] label={label:<12} dx={dx:+.4f}  dy={dy:+.4f}  "
+                      f"arm_x={ARM_BASE:.3f}+{ARM_K:.1f}×{dy:+.4f}={arm_x:.4f}  {bar}")
+
+                # 机械臂同步移动到计算出的位置
+                if last_arm_x is None or abs(arm_x - last_arm_x) > 0.002:
+                    my_car.arm.move_x_position(arm_x)
+                    my_car.arm.move_x_position(arm_x)
+                    last_arm_x = arm_x
+
+                # 每 INTERVAL 秒拍一张照片
+                now = time_mod.time()
+                if now - last_shot >= INTERVAL:
+                    my_car.save_align_debug_img(delta_x=0.0, dx=dx, label=label, dy=dy)
+                    last_shot = now
+            else:
+                print(f"  [{time_mod.strftime('%H:%M:%S')}] 未检测到目标...")
+
+            time_mod.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\n  机械臂归位...")
+        my_car.arm.move_x_position(0.15)  # 回到中间位置
+        my_car.arm.move_x_position(0.15)  # 回到中间位置
+        print("  退出调试。")
+import threading
+# 防止检测和OCR被多个线程同时调用
+INFERENCE_LOCK = threading.RLock()
+
+def align_to_order_machine(
+    delta_x=-0.0,
+    time_out=8.0,
+    label="order",
+    x_thr=0.04,
+    max_retries=2,
+):
+    """
+    识别订单机并调整车的前后位置。
+
+    巡线结束后调用此函数。不动机械臂，保持当前姿态，
+    仅通过底盘前后移动将订单机在侧摄像头画面中水平居中，等效于到达正确的前后距离。
+
+    原理：
+      - 侧摄像头的水平方向 (dx) 对应车的前后方向
+      - 将订单机在画面中水平居中（dx ≈ delta_x），即车到达正确距离
+      - 如果目标偏左，车前进；偏右，车后退（具体方向取决于机械臂安装侧）
+
+    参数:
+        delta_x:     目标在画面中的水平偏移（归一化坐标，默认 0 = 居中）
+                     车太近 → 往正值调；车太远 → 往负值调（需实测确认方向）
+        time_out:    单次对准超时（秒），默认 8s
+        label:       检测目标标签，默认 "order"
+        x_thr:       前后对准容差（归一化坐标），越小越精确
+        max_retries: 未检测到目标时，底盘微调重试次数
+
+    返回:
+        dict: {
+            "success": True/False,
+            "label": 识别到的标签或 None,
+            "dy": 目标的垂直偏移,
+            "dx_final": 最终的水平偏移,
+        }
+    """
+    print(f"\n{'='*50}")
+    print(f"[订单机对准] 开始调整前后位置（不动机械臂）")
+    print(f"[订单机对准] delta_x={delta_x:+.3f}, x_thr={x_thr:.3f}, "
+          f"time_out={time_out:.1f}s, max_retries={max_retries}")
+    print(f"{'='*50}")
+
+    for retry in range(max_retries + 1):
+        if retry > 0:
+            # 当前位置没看到订单机，底盘微调前进再试
+            print(f"\n[订单机对准] 当前位置未检测到订单机，第{retry}次微调重试...")
+            my_car.move_for([0.03, 0.0, 0.0])
+            time.sleep(0.5)
+
+        cls_id, det_label, dy_final = my_car.move_to_detection_target(
+            delta_x=delta_x,
+            delta_y=None,        # 不动机械臂
+            label=label,
+            time_out=time_out,
+            x_thr=x_thr,
+        )
+
+        if det_label == label:
+            dets = my_car.get_detection_results()
+            dx_final = None
+            for d in dets:
+                if d[2] == label:
+                    dx_final = d[4]
+                    break
+
+            my_car.beep()
+            dy_str = f"{dy_final:+.4f}" if dy_final is not None else "N/A"
+            dx_str = f"{dx_final:+.4f}" if dx_final is not None else "N/A"
+            print(f"[订单机对准] ✅ 对准完成!  label={det_label}  "
+                  f"dy={dy_str}  dx_final={dx_str}")
+            print(f"{'='*50}\n")
+            return {
+                "success": True,
+                "label": det_label,
+                "dy": dy_final,
+                "dx_final": dx_final,
+            }
+
+    print(f"[订单机对准] ✗ 重试{max_retries}次后仍未成功对准订单机「{label}」")
+    print(f"{'='*50}\n")
+    return {
+        "success": False,
+        "label": None,
+        "dy": None,
+        "dx_final": None,
+    }
+
+
+def align_to_text_label(label="order", delta_x=-0.0, time_out=6.0, max_retries=3, x_thr=0.04, min_alignments=3):
+    """
+    使用循环将摄像头对准指定文本标签目标，至少对准 min_alignments 次后才返回。
+
+    每次循环调用 move_to_detection_target 尝试检测并对齐 label，
+    未检测到时底盘向前微调后重试。只有连续 min_alignments 次对准成功才返回成功。
+
+    参数:
+        label          : 检测目标标签，默认 "order"
+        delta_x        : 目标水平偏移（归一化坐标），默认 0 = 居中
+                         文本偏右 → +0.05，文本偏左 → -0.05
+        time_out       : 单次对准超时（秒）
+        max_retries    : 单次对准未检测到时的重试次数
+        x_thr          : 水平对准容差
+        min_alignments : 最少连续对准成功次数，默认 5
+
+    返回:
+        dict: {
+            "success": True/False,
+            "label": 识别到的标签或 None,
+            "dy": 目标的垂直偏移或 None,
+        }
+    """
+    print(f"\n{'='*50}")
+    print(f"[文本对准] 开始对准 label={label} | delta_x={delta_x:+.3f} time_out={time_out:.1f}s x_thr={x_thr:.3f} max_retries={max_retries} min_alignments={min_alignments}")
+    print(f"{'='*50}")
+
+    last_dy = None
+    last_label = None
+    last_confirmed_seq = None
+
+    for align_idx in range(min_alignments):
+        print(f"\n[文本对准] --- 第 {align_idx + 1}/{min_alignments} 次对准 ---")
+        aligned = False
+
+        # 旧版每次成功后的三连蜂鸣天然间隔约0.9秒。静音优化后必须显式
+        # 等待新的物理帧，否则5次确认可能重复消费同一个 frame_seq。
+        if last_confirmed_seq is not None:
+            new_frame_deadline = time.monotonic() + max(0.5, min(1.0, time_out))
+            got_new_frame = False
+            while time.monotonic() < new_frame_deadline:
+                if getattr(my_car, "_stop_flag", False):
+                    break
+                _, current_seq, _ = my_car.cap_front.read_with_meta(timeout=0.05)
+                if current_seq > last_confirmed_seq:
+                    got_new_frame = True
+                    break
+                time.sleep(0.01)
+            if not got_new_frame:
+                print("[文本对准] ❌ 摄像头没有产生新帧，拒绝重复帧确认")
+                return {
+                    "success": False,
+                    "label": last_label,
+                    "dy": last_dy,
+                }
+
+        for retry in range(max_retries + 1):
+            if retry > 0:
+                print(f"[文本对准] 第{retry}次重试：向前微调后重新检测...")
+                my_car.move_for([0.10, 0.0, 0.0])
+                time.sleep(0.5)
+
+            cls_id, det_label, dy = my_car.move_to_detection_target2(
+                label=label,
+                delta_x=delta_x,
+                delta_y=None,
+                time_out=time_out,
+                x_thr=x_thr,
+                save_images=False,
+                success_beeps=0,
+                update_stream=False,
+            )
+
+            if det_label == label:
+                print(f"[文本对准] ✅ 第 {align_idx + 1}/{min_alignments} 次对准完成!  label={det_label}  dy={dy:+.4f}" if dy is not None else
+                      f"[文本对准] ✅ 第 {align_idx + 1}/{min_alignments} 次对准完成!  label={det_label}  dy=None")
+                last_dy = dy
+                last_label = det_label
+                last_confirmed_seq = getattr(my_car, "_last_selected_seq", 0)
+                aligned = True
+                break
+            else:
+                print(f"[文本对准] ✗ 未检测到 {label}（检测到: {det_label}），剩余重试 {max_retries - retry} 次")
+
+        if not aligned:
+            print(f"\n[文本对准] ❌ 第 {align_idx + 1}/{min_alignments} 次对准失败")
+            print(f"{'='*50}\n")
+            return {
+                "success": False,
+                "label": last_label,
+                "dy": last_dy,
+            }
+
+        # 已对准一次即返回，不再进行下一次重复识别，加快订单机对准
+        break
+
+    print(f"\n[文本对准] 🎯 对准完成!")
+    my_car.beep()
+    print(f"{'='*50}\n")
+    return {
+        "success": True,
+        "label": last_label,
+        "dy": last_dy,
+    }
+
+# 货架扫描位置表：(车前进量 df, 机械臂 X 位置 ax)
+# 货架两列 × 四行，每个视野看两个货物（一列上面两个、下面两个）
+SCAN_STEPS = [
+    (0.0, 0.30),   # 第 1 列上方（上面两个货）
+    (0.0, 0.18),   # 第 1 列下方（下面两个货）
+    (0.12, 0.30),  # 第 2 列上方（车前进 0.12，手臂 X 回 0.30）
+    (0.0, 0.18),   # 第 2 列下方
+]
+
+
+def find_any_goods(labels, start_step=0):
+    """扫描货架，寻找 labels 中出现的货物。
+    货架为两列 × 四行：手臂 X=0.30 看一列上面两个、X=0.19 看下面两个；车前进 0.12 换第二列。
+    返回 (当前视野里属于 labels 的货物标签列表, 扫描步)；一个都没有返回 ([], -1)。
+    labels: 视觉标签列表，如 ["h_qing_jiao", "h_fan_qie"]
+    start_step: 从第几步开始扫（抓完一个接着扫，不回起点）"""
+    for step in range(start_step, len(SCAN_STEPS)):
+        df, ax = SCAN_STEPS[step]
+        if df:
+            my_car.move_for([df, 0, 0])        # 车前进换列
+        if ax is not None:
+            my_car.arm.move_x_position(ax)     # 手臂 X 调整视野（看上面/下面）
+            my_car.arm.move_x_position(ax)     # 手臂 X 调整视野（看上面/下面）
+        # 收集当前视野里所有属于订单的货物（一个视野里可能有两个挨着的目标）
+        dets = my_car.get_detection_results()
+        print(f"[扫描 step={step}] 视野识别到的标签: {[(det[2], round(float(det[3]), 2)) for det in dets]}")
+        found = [det[2] for det in dets if det[2] in labels]
+        if found:
+            return found, step
+    return [], -1
+
+def grab_and_discard():
+    """吸住当前对准的货物，转到40°扔掉，再回到抓取姿态"""
+    my_car.arm.grasp(False)  # 气泵吸气，吸住货物
+    my_car.arm.grasp(False)  # 气泵吸气，吸住货物
+    my_car.arm.move_y_position(0.05)  # 机械臂下探吸稳
+    my_car.arm.move_y_position(0.05)  # 机械臂下探吸稳
+    time.sleep(0.5)  # 等待吸稳
+    my_car.arm.move_y_position(0.2)  # 机械臂抬起货物
+    my_car.arm.move_y_position(0.2)  # 机械臂抬起货物
+    my_car.arm.move_x_position(0.0)
+    my_car.arm.move_x_position(0.0)
+    my_car.arm.set_arm_angle(40) 
+    time.sleep(0.5)
+    my_car.arm.set_arm_angle(40) 
+    time.sleep(0.5)  # 等待稳定 # 手臂转到 40°（丢弃方向）
+    my_car.arm.grasp(True)  # 关气泵，扔掉货物
+    my_car.arm.grasp(True)  # 关气泵，扔掉货物
+    
+    my_car.arm.set_arm_angle("RIGHT")  # 转回抓取角度
+    my_car.arm.set_arm_angle("RIGHT")  # 转回抓取角度
+    my_car.arm.move_y_position(0.11)  # 抬到取货高度
+    my_car.arm.move_y_position(0.11)  # 抬到取货高度
+
+def get_order():
+    """获取订单任务：先识别订单标签 -> 大模型解析订单 -> 去货架吸走订单货物（吸完转40°扔掉）"""
+    # 货物中文名 -> 视觉识别标签 的对应关系（大模型返回的是中文货物名，这里映射成摄像头能识别的标签）
+    goods_dict = {
+        "青椒": "h_qing_jiao",
+        "蘑菇": "h_mo_gu",
+        "芹菜": "h_qin_cai",
+        "番茄": "h_fan_qie",
+        "油菜": "h_you_cai",
+        "豆角": "h_dou_jiao",
+        "西兰花": "h_xi_lan_hua",
+        "土豆": "h_tu_dou",
+        "金针菇": "h_jin_zhen_gu",
+    }
+
+    order_list = []  # 存放大模型解析后的订单信息（dict：姓名/货物/楼号）
+
+    # 对齐订单
+    my_car.arm.move_x_position(0.15)
+    my_car.arm.move_x_position(0.15)
+    cls_id, label = my_car.move_to_detection_target(time_out=10.0,delta_y=None,pid_params={"RIGHT": {"kp_x": -0.05}})  # 视觉对准订单标签（只平移不上下偏移）
+    if label is None:  # 没识别到订单机：前进 0.1 再识别一次
+        print("[WARN] 未识别到订单机，前进 0.1 后重试")
+        my_car.move_for([0.1, 0, 0])
+        cls_id, label = my_car.move_to_detection_target(time_out=10.0,delta_y=None,pid_params={"RIGHT": {"kp_x": -0.05}})
+    order_loc = my_car.get_odometry(True)  # 记录对齐订单后的位置，后面推完推杆用 move_to_position 回到这里
+    # 推动推杆
+    my_car.arm.move_x_position(0.0)
+    my_car.arm.move_x_position(0.0)
+    my_car.move_for([0.065, 0, 0])  # 整车再前进 0.065 米，用推杆把订单标签推出来/推到位
+    my_car.arm.move_x_position(0.2)  # 机械臂 X 轴伸出到 0.23（伸向订单标签方向）
+    my_car.arm.move_x_position(0.2)  # 机械臂 X 轴伸出到 0.23（伸向订单标签方向）
+    my_car.arm.move_x_position(0.1)  # 机械臂 X 轴缩回到 0.1（退回准备识别）
+    my_car.arm.move_x_position(0.1)  # 机械臂 X 轴缩回到 0.1（退回准备识别）
+    my_car.move_to_position(order_loc)  # 推杆结束后回到前面记录的对齐位置，直接开始识别
+    time.sleep(0.5)  # 等待车身归位稳定
+
+    # ===== 订单拍照 + 大模型识别（图片输入，替代原来的 OCR + 文本大模型）=====
+    order_pic_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "order_pic")
+    os.makedirs(order_pic_dir, exist_ok=True)
+
+    def _capture_order_image(filename, settle_seconds=0.0):
+        """拍摄当前订单图片并保存到 order_pic，返回保存路径（失败返回 None）。"""
+        if settle_seconds > 0:
+            # 机械臂刚转动后摄像头需稳定，等待片刻再取帧
+            time.sleep(settle_seconds)
+        # 刷新检测帧，取与检测同帧的图像，优先裁出 order 框以孤立订单文字
+        dets = my_car.get_detection_results(update_stream=False)
+        frame = getattr(my_car, "_last_det_img", None)
+        if frame is None:
+            print(f"[WARN] {filename} 拍摄失败：无检测帧")
+            return None
+        frame = frame.copy()
+
+        order_crop = None
+        for det in dets:
+            if det[2] != "order":
+                continue
+            x_c, y_c, w, h = det[4], det[5], det[6], det[7]
+            w *= 1.6
+            h *= 1.6
+            img_h, img_w = frame.shape[:2]
+            cx = int((x_c + 1) / 2 * img_w)
+            cy = int((y_c + 1) / 2 * img_h)
+            bw = int(w * img_w / 2)
+            bh = int(h * img_h / 2)
+            left_extra = int(bw * 0.2)
+            x1 = max(0, int(cx - bw / 2) - left_extra)
+            y1 = max(0, int(cy - bh / 2))
+            x2 = min(img_w, int(cx + bw / 2))
+            y2 = min(img_h, int(cy + bh / 2))
+            if x1 < x2 and y1 < y2:
+                order_crop = frame[y1:y2, x1:x2]
+            break
+
+        img_to_save = order_crop if order_crop is not None else frame
+        path = os.path.join(order_pic_dir, filename)
+        cv2.imwrite(path, img_to_save)
+        print(f"[订单拍照] 已保存: {path}")
+        return path
+
+    def _recognize_order_image(path, tag):
+        """调用大模型识别订单图片，返回结构化订单 dict（失败返回 None）。"""
+        import json
+        import base64
+        try:
+            with open(path, "rb") as f:
+                base64_image = base64.b64encode(f.read()).decode("utf-8")
+        except Exception as e:
+            print(f"[WARN] {tag}读取订单图片失败: {type(e).__name__}: {e}")
+            return None
+
+        client = my_car.order_analysis.client
+        image_model = my_car.order_analysis.image_model
+        # goods 直接返回中文名，与 goods_dict 的键保持一致，下游用 goods_dict 映射成视觉标签
+        goods_mapping = "，".join(goods_dict.keys())
+        system_prompt = (
+            "请识别订单图片中的人名、货物和配送地址，并返回JSON。"
+            f"goods字段的值必须且只能是以下蔬菜的中文名：{goods_mapping}。address字段的值只为数字,goods中只有一种食材"
+            '只返回JSON数据，格式如 {"name":"王五","goods":"豆角","address":1}。'
+        )
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": system_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+            ],
+        }]
+        # 大模型请求：出错重试，含首次最多 3 次
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model=image_model,
+                    messages=messages,
+                    extra_body={"stream": False},
+                    top_p=0.1,
+                    timeout=15.0,
+                )
+                content = response.choices[0].message.content
+                break
+            except Exception as e:
+                print(f"[WARN] {tag}大模型请求失败(第{attempt+1}次): {type(e).__name__}: {e}")
+                if attempt == 2:  # 第 3 次仍失败，放弃
+                    return None
+                time.sleep(0.5)
+
+        # 优先按纯 JSON 解析，失败再尝试提取 ```json 代码块
+        order = None
+        try:
+            order = json.loads(content)
+        except Exception:
+            order = my_car.order_analysis.get_json_str(content)
+
+        if isinstance(order, dict) and "goods" in order:
+            print(f"[INFO] {tag}大模型识别完成: {order}")
+            return order
+        else:
+            print(f"[WARN] {tag}大模型识别结果非预期格式: {type(order).__name__} = {order}")
+            return None
+
+    order1_path = _capture_order_image("order_1.jpg")  # 拍摄随机订单图片
+    my_car.beep()  # 蜂鸣提示：识别完成一次
+    # 识别固定标签
+    my_car.arm.move_y_position(0.2)  # 机械臂 Y 轴升到 0.2（抬高）
+    my_car.arm.move_y_position(0.2)  # 机械臂 Y 轴升到 0.2（抬高）
+    my_car.arm.move_x_position(0.21)  # 机械臂 X 轴伸到 0.21（对准固定标签）
+    my_car.arm.move_x_position(0.21)  # 机械臂 X 轴伸到 0.21（对准固定标签）
+    my_car.arm.set_hand_angle(-50)  # 手部角度设为中间位置
+    my_car.arm.set_hand_angle(-50)  # 手部角度设为中间位置
+    my_car.get_detection_results()  # 获取一次检测结果（刷新检测框，供后续拍照使用）
+    order2_path = _capture_order_image("order_2.jpg", settle_seconds=0.5)  # 拍摄固定订单图片
+    my_car.beep()  # 蜂鸣提示：识别完成
+
+    # 使用大模型分析订单图片（拍照后调用大模型，替代原来的 OCR 文本解析）
+    order_list.append(_recognize_order_image(order1_path, "随机订单") if order1_path else None)
+    order_list.append(_recognize_order_image(order2_path, "固定订单") if order2_path else None)
+    # 保护：过滤掉识别/解析失败的订单（None 或缺少关键字段），避免后面取货崩溃
+    # 只关心所需货物，不再按楼号排序（不需要配送）
+    order_list = [o for o in order_list if isinstance(o, dict) and "goods" in o]
+    print(order_list)  # 打印解析后的订单，方便调试
+
+    my_car.move_distance([0.4,0,0], dis=0.16)  # 沿车道线前进 0.2 米，靠近货架
+    my_car.arm.set_hand_angle(angle="DOWN")  # 手部角度朝下，准备取货
+    my_car.arm.set_hand_angle(angle="DOWN")  # 手部角度朝下，准备取货
+    my_car.arm.move_y_position(0.11)  # 机械臂 Y 轴升到 0.2（抬到取货高度）
+    my_car.arm.move_y_position(0.11)  # 机械臂 Y 轴升到 0.2（抬到取货高度）
+    my_car.arm.move_x_position(0.30)  # 机械臂 X 轴伸到 0.30（伸进货架）
+    my_car.arm.move_x_position(0.30)  # 机械臂 X 轴伸到 0.30（伸进货架）
+
+    # 取货：扫到哪个订单货物就先吸哪个，吸完转40°扔掉，接着扫剩下的（车身不来回倒）
+    remain = [goods_dict[o["goods"]] for o in order_list]  # 所需货物的视觉标签（固定两件）
+    step = 0  # 当前扫描位置
+    while remain:
+        found, step = find_any_goods(remain, start_step=step)
+        if not found:
+            break  # 扫描到头还没找全（可在这里补兜底逻辑）
+        # 对准并抓取第一个（视野里靠上的那个）
+        my_car.move_to_detection_target(label=found[0], delta_y=-0.7,time_out=10.0,pid_params={"RIGHT": {"kp_x": -0.035, "kp_y": -0.025}}, arm_step_limit=0.01)  # -0.5 为对准时的垂直偏移，可按需调
+        print(f"识别到订单货物，正在吸取：{found[0]}")
+        grab_and_discard()
+        remain.remove(found[0])
+        # 两个所需货物在同一个区域（这一视野同时扫到两个）：抓完第一个后重新扫描这个区域，再对准抓第二个
+        if len(found) > 1:
+            # 抓完第一个货物后机械臂 X 已被 grab_and_discard 缩回 0，这里用 SCAN_STEPS 参数
+            # 把机械臂 X 摆回该区域的识别位置，而不是停留在抓上一个货物的位置（那样会看不见第二个）
+            _, ax = SCAN_STEPS[step]
+            my_car.arm.move_x_position(ax)
+            my_car.arm.move_x_position(ax)
+            found2, step2 = find_any_goods(remain, start_step=step)
+            if found2:
+                my_car.move_to_detection_target(label=found2[0], delta_y=-0.7,time_out=10.0,pid_params={"RIGHT": {"kp_x": -0.035, "kp_y": -0.025}},arm_step_limit=0.01)
+                print(f"同一区域另一货物，重新扫描后吸取：{found2[0]}")
+                grab_and_discard()
+                remain.remove(found2[0])
+                step = step2  # 重新扫描后更新扫描位置
+        # 当前区域已抓完（无论抓到 1 个还是 2 个），跳到下一个区域，避免下一轮重复扫描已扫过的区域
+        step += 1
+
+    my_car.arm.reset_position()  # 回订单机前复位机械臂（复位 x/y、手 UP、臂 RIGHT），避免残留抓取姿态影响移动
+    my_car.arm.reset_position()  # 回订单机前复位机械臂（复位 x/y、手 UP、臂 RIGHT），避免残留抓取姿态影响移动
+    my_car.move_to_position(order_loc)  # 取货完成后回到订单机位置
+
+    return order_list  # 返回解析后的订单列表
+
+def get_order1(debug=False):
+    """
+    识别订单
+
+    :param debug: 是否开启调试模式
+    :return: None
+
+    核心逻辑：
+    1. 初始化机械臂搜索姿态
+    2. 根据是否为调试模式，设置不同的距离，自动巡航到订单机附近
+    3. 根据相对位置偏移，伸出机械臂触发推杆从而获取随机订单
+    4. 利用对象检测以及OCR获取订单文字
+    5. 利用大语言模型对订单文字进行结构化解析并排序, 将2号楼的订单排在前面优先拿取
+    6. 向前移动到货架位置，根据4个预设的位置参数，搜索并拾取商品，每个预设位置大概对应2个商品
+    7. 停止点为机械臂正对第二排货架（远端）
+
+    """
+
+    performance_cfg = getattr(my_car, "performance_cfg", {}) or {}
+    timing_log = _config_switch(performance_cfg, "timing_log", 1)
+    save_grasp_debug_images = _config_switch(
+        performance_cfg, "save_grasp_debug_images", 0
+    )
+    task_started = time.monotonic()
+
+    def perf_log(stage, started_at, detail=""):
+        if not timing_log:
+            return
+        suffix = f" | {detail}" if detail else ""
+        print(
+            f"[PERF][get_order1] {stage}="
+            f"{time.monotonic() - started_at:.3f}s{suffix}"
+        )
+
+    ################################## 常量定义 ##################################
+    SEARCHING_POSE ={
+        'x': 0.01,
+        'y': 0.01,
+        'arm': "RIGHT",
+        'hand': "MID"
+    }
+    GOODS_LABEL_DICT = {
+        "青椒": "h_qing_jiao",
+        "蘑菇": "h_mo_gu",
+        "芹菜": "h_qin_cai",
+        "番茄": "h_fan_qie",
+        "油菜": "h_you_cai",
+        "豆角": "h_dou_jiao",
+        "西兰花": "h_xi_lan_hua",
+        "土豆": "h_tu_dou",
+        "金针菇": "h_jin_zhen_gu",
+    }
+
+    PREALIGN_PARAMS_FOR_SEARCHING = [
+        {
+            "x": 0.15,
+            "y": 0.15    # 第一列，上层
+        },
+        {
+            "x": 0.30,
+            "y": 0.15    # 第一列，下层
+        },
+        {
+            "x": 0.30,   # 车前进后切到第二列
+            "y": 0.15    # 第二列，上层
+        },
+        {
+            "x": 0.15,   # 第二列
+            "y": 0.15    # 第二列，下层
+        },
+
+    ]
+    OFFSET_TO_TRIGGER = 0.065
+    SHELF_DISTANCE = 0.20    # 订单机到货架的前进距离，不稳时调这个
+    COLUMN_SPACING = 0.14   # 货架两列之间的间距（米），识别时前进/后退的量
+    GRASP_Y = 0.03           # 抓取时机械臂下降高度，抓偏下就往上调大这个值
+    DETECT_TIMEOUT = 8.0     # 视觉对齐超时（秒），识别不准就加大
+    PLACE_X = 0              # 放置时机械臂 x 轴位置（往平台放的位置）
+    PLACE_Y_FIRST = 0.06     # 第一个货物放置高度
+    PLACE_Y_SECOND = 0.15    # 第二个货物放置高度（堆叠在上）
+
+    # ---- 机械臂视觉修正（仅本任务，不影响其他函数）----
+    ALIGN_KP = 0.22             # 比例增益（调大，单次步子更大更快）
+    ALIGN_MAX_STEP = 0.05       # [已弃用] 单次最大调整量（米），已被 align_arm_to_target 的 step_limit 参数取代
+    ALIGN_DY_TOLERANCE = 0.05   # dy 容差（放宽，更快判定对准）
+    ALIGN_MAX_ITERS = 15        # 迭代次数上限
+    ALIGN_TIMEOUT = 10.0        # 超时（秒）
+
+    # ===  核心参数：目标 dy ===
+    # 手动将吸盘对准西兰花实测得出：dy ≈ -0.74
+    # 抓取前吸盘需回退一点：目标 dy 从 -0.74 调到 -0.70（蔬菜在画面稍靠下=吸盘相对后退）
+    # 因为摄像头在吸盘上方较远，对准后目标已经在画面顶端
+    TARGET_DY = -0.61
+
+    ################################## 函数定义 ##################################
+    def align_arm_to_target(label, step_limit=0.04):
+        """直接修正目标在画面中的上下位置，使吸盘对准目标。
+
+        不再以 dy=0（画面中心）为目标，而是以 TARGET_DY 为目标。
+        TARGET_DY 是吸盘刚好在目标正上方时，目标在摄像头画面中的 dy 值。
+        这个值由摄像头和吸盘的物理间距决定，标定后对所有蔬菜通用。
+
+        只做上下（dy → x 轴）修正，左右（dx）不修正。
+
+        step_limit: 机械臂 x 轴单次最大移动量（米），默认 0.01。
+        """
+        t_stop = time.time() + ALIGN_TIMEOUT
+        final_dy = None
+
+        for i in range(ALIGN_MAX_ITERS):
+            if time.time() > t_stop:
+                break
+
+            dets = my_car.get_detection_results(update_stream=False)
+            dy = None
+            for d in dets:
+                if d[2] == label:
+                    dy = d[5]
+                    break
+
+            if dy is None:
+                time.sleep(0.2)
+                continue
+
+            final_dy = dy
+            error = TARGET_DY - dy   # 还差多少才能到目标 dy
+
+            if abs(error) < ALIGN_DY_TOLERANCE:
+                print(f"  [对准] ✓ dy={dy:+.4f} → 目标{TARGET_DY:+.4f}  误差{error:+.4f}  迭代{i+1}/{ALIGN_MAX_ITERS}")
+                break
+
+            # 比例修正：error>0(需要dy增大) → 伸臂(X↑)；error<0(需要dy减小) → 缩臂(X↓)
+            correction = error * ALIGN_KP
+            correction = max(-step_limit, min(step_limit, correction))
+            cur_x = my_car.arm.x_get_position()
+            cur_x = my_car.arm.x_get_position()
+            new_x = cur_x + correction
+            my_car.arm.move_x_position(new_x)
+            my_car.arm.move_x_position(new_x)
+            print(f"  [对准] dy={dy:+.4f} 目标={TARGET_DY:+.4f} 误差={error:+.4f} → 校正={correction:+.4f}m → x: {cur_x:.4f}→{new_x:.4f}  [{i+1}/{ALIGN_MAX_ITERS}]")
+            time.sleep(0.2)
+        else:
+            print(f"  [对准] 达到最大迭代次数, 最终 dy={final_dy:+.4f}" if final_dy is not None
+                  else "  [对准] 超时, 始终未检测到目标")
+
+    def pick_and_place_good(is_first_good_picked, label):
+        """拾取当前对准的商品并放入放置平台（PID 视觉修正）"""
+        grasp_started = time.monotonic()
+        print(f"[抓取] 即将抓取: {label}")
+        # PID 动态对准（dy → x轴）
+        align_started = time.monotonic()
+        align_arm_to_target(label)
+        perf_log(f"商品机械臂对准[{label}]", align_started)
+
+        # ---- 抓取前拍照，用检测实际用的帧，画上检测框和 dy 信息 ----
+        if save_grasp_debug_images:
+            import os as _os
+            save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_debug")
+            _os.makedirs(save_dir, exist_ok=True)
+            timestamp = int(time.time() * 1000)
+
+            # 用检测使用的同一帧（_last_det_img），不是新读一帧
+            frame = getattr(my_car, '_last_det_img', None)
+            if frame is not None:
+                frame = frame.copy()
+            else:
+                frame = my_car.get_latest_side_frame()
+
+            if frame is not None:
+                h, w = frame.shape[:2]
+                cx, cy = w // 2, h // 2
+
+                # 画十字准星（画面中心）
+                cv2.line(frame, (cx, cy - 40), (cx, cy + 40), (0, 255, 0), 2)
+                cv2.line(frame, (cx - 40, cy), (cx + 40, cy), (0, 255, 0), 2)
+
+                # 画检测框 + dy 数值，方便判断目标是否在上下中间
+                dets = my_car.get_detection_results()
+                dy = None
+                for d in dets:
+                    if d[2] == label:
+                        _, _, det_label, score, dx, dy, bw, bh = d
+                        # 检测框中心在画面中的像素位置
+                        det_cx = int(cx + dx * w)
+                        det_cy = int(cy + dy * h)
+                        box_x1 = int(det_cx - bw * w / 2)
+                        box_y1 = int(det_cy - bh * h / 2)
+                        box_x2 = int(det_cx + bw * w / 2)
+                        box_y2 = int(det_cy + bh * h / 2)
+                        cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 255), 2)
+                        cv2.line(frame, (det_cx, det_cy - 15), (det_cx, det_cy + 15), (0, 0, 255), 1)
+                        cv2.line(frame, (det_cx - 15, det_cy), (det_cx + 15, det_cy), (0, 0, 255), 1)
+                        break
+
+                # 标注信息
+                if dy is not None:
+                    error = TARGET_DY - dy
+                    status = "✓" if abs(error) < ALIGN_DY_TOLERANCE else ("需伸臂" if error > 0 else "需缩臂")
+                    cv2.putText(frame, f"Grasp: {label}  dy={dy:+.4f}  target={TARGET_DY:+.4f}  err={error:+.4f} {status}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+                    # 画目标 dy 位置的水平参考线
+                    target_cy = int(cy + TARGET_DY * h)
+                    cv2.line(frame, (0, target_cy), (w, target_cy), (255, 255, 0), 1)
+                    cv2.putText(frame, f"target", (w - 80, target_cy - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
+                else:
+                    error = None
+                    cv2.putText(frame, f"Grasp: {label}  (未检测到目标)", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+
+                filename = _os.path.join(save_dir, f"grasp_{label}_{timestamp}.jpg")
+                cv2.imwrite(filename, frame)
+                if dy is not None:
+                    print(f"[拍照] 抓取前照片已保存: {filename}  dy={dy:+.4f}  target={TARGET_DY:+.4f}  err={error:+.4f}")
+                else:
+                    print(f"[拍照] 抓取前照片已保存: {filename}  (未检测到目标)")
+        # ----------------------------------------------------
+
+        # 吸取商品
+        action_started = time.monotonic()
+        my_car.arm.move_y_position(GRASP_Y)   # 下降到蔬菜
+        my_car.arm.move_y_position(GRASP_Y)   # 下降到蔬菜
+        my_car.arm.grasp(False)               # 吸住（气泵反：False 才是吸住）
+        my_car.arm.grasp(False)               # 吸住（气泵反：False 才是吸住）
+        my_car.arm.move_y_position(0.18)      # 抬起（带蔬菜）
+        my_car.arm.move_y_position(0.18)      # 抬起（带蔬菜）
+        # 收回机械臂
+        my_car.arm.move_x_position(0)
+        my_car.arm.move_x_position(0)
+        my_car.arm.set_arm_angle("MID") 
+        my_car.arm.set_arm_angle("MID") 
+        time.sleep(0.5)      # 手臂回 MID
+        my_car.arm.grasp(True)                # 释放（放）：气泵反，等机械臂 MID 之后再放
+        my_car.arm.grasp(True)                # 释放（放）：气泵反，等机械臂 MID 之后再放
+        # 恢复搜索姿态
+
+        my_car.arm.set_arm_pose(arm="RIGHT", hand="DOWN")
+        my_car.arm.set_arm_pose(arm="RIGHT", hand="DOWN")
+        perf_log(f"商品抓取动作[{label}]", action_started)
+        perf_log(f"商品抓取总计[{label}]", grasp_started)
+
+    ################################## 任务流程 ##################################
+    # 根据相对位置偏移，伸出机械臂触发推杆从而获取随机订单
+    stage_started = time.monotonic()
+    my_car.arm.set_arm_pose(x=0)
+    my_car.arm.set_arm_pose(x=0)
+    my_car.arm.set_arm_pose(x=0.10)
+    my_car.arm.set_arm_pose(x=0.10)
+    align_result = align_to_text_label(delta_x=+0.18, time_out=3.0, max_retries=1, min_alignments=3)
+    perf_log(
+        "订单机连续对准",
+        stage_started,
+        f"success={align_result.get('success', False)}",
+    )
+    # 记录定位后的位置，任务结束时回到此处
+    order_machine_pos = list(my_car.get_odometry())
+    print(f"[位置记录] 订单机对准位置: {order_machine_pos}")
+    stage_started = time.monotonic()
+    my_car.move_distance([0.2, 0, 0],0.05)
+    my_car.arm.set_arm_pose(x=0.20)
+    my_car.arm.set_arm_pose(x=0.20)
+    my_car.arm.set_arm_pose(x=0.10)
+    my_car.arm.set_arm_pose(x=0.10)
+    perf_log("订单机触发动作", stage_started)
+    # 准备一个空的列表，用于存储解析后的订单信息
+    formated_orders = []
+
+    # 向后移动（退回首次对准订单机的位置，与前进距离一致）
+    my_car.move_for([-0.065, 0, 0])
+
+
+    # ===== 保存订单图片并用大模型识别（图片输入，后台线程执行，不阻塞后续动作）=====
+    order_pic_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "order_pic")
+    os.makedirs(order_pic_dir, exist_ok=True)
+
+    def _capture_order_image(filename, settle_seconds=0.0):
+        """拍摄当前订单图片并保存到 order_pic，返回保存路径（失败返回 None）。"""
+        if settle_seconds > 0:
+            # 机械臂刚转动后摄像头需稳定，等待片刻再取帧
+            time.sleep(settle_seconds)
+        # 刷新检测帧，取与检测同帧的图像，优先裁出 order 框以孤立订单文字
+        dets = my_car.get_detection_results(update_stream=False)
+        frame = getattr(my_car, "_last_det_img", None)
+        if frame is None:
+            print(f"[WARN] {filename} 拍摄失败：无检测帧")
+            return None
+        frame = frame.copy()
+
+        order_crop = None
+        for det in dets:
+            if det[2] != "order":
+                continue
+            x_c, y_c, w, h = det[4], det[5], det[6], det[7]
+            w *= 1.6
+            h *= 1.6
+            img_h, img_w = frame.shape[:2]
+            cx = int((x_c + 1) / 2 * img_w)
+            cy = int((y_c + 1) / 2 * img_h)
+            bw = int(w * img_w / 2)
+            bh = int(h * img_h / 2)
+            left_extra = int(bw * 0.2)
+            x1 = max(0, int(cx - bw / 2) - left_extra)
+            y1 = max(0, int(cy - bh / 2))
+            x2 = min(img_w, int(cx + bw / 2))
+            y2 = min(img_h, int(cy + bh / 2))
+            if x1 < x2 and y1 < y2:
+                order_crop = frame[y1:y2, x1:x2]
+            break
+
+        img_to_save = order_crop if order_crop is not None else frame
+        path = os.path.join(order_pic_dir, filename)
+        cv2.imwrite(path, img_to_save)
+        print(f"[订单拍照] 已保存: {path}")
+        return path
+
+    def _recognize_order_image(path, tag):
+        """后台线程：调用大模型识别订单图片，结果写入 formated_orders。"""
+        import json
+        import base64
+        try:
+            with open(path, "rb") as f:
+                base64_image = base64.b64encode(f.read()).decode("utf-8")
+        except Exception as e:
+            print(f"[WARN] {tag}读取订单图片失败: {type(e).__name__}: {e}")
+            return
+
+        client = my_car.order_analysis.client
+        image_model = my_car.order_analysis.image_model
+        # 要求模型将 goods 直接返回为项目视觉识别使用的英文标签，
+        # 中文名与英文标签的对应关系由 GOODS_LABEL_DICT 给出，保证与检测模型一致。
+        goods_mapping = "，".join(
+            f"{cn}→{en}" for cn, en in GOODS_LABEL_DICT.items()
+        )
+        system_prompt = (
+        "请识别订单图片中的人名、货物和配送地址，并严格返回JSON格式数据。\n"
+         f"goods字段的值必须且只能是以下蔬菜对应的英文标签之一：{goods_mapping}。注意：每张图片仅对应一种蔬菜，且只能返回一个goods标签。\n"
+         "青菜，大白菜归类为油菜，h_you_cai"
+        "address字段的值必须且只能是纯数字。\n"
+        '只返回JSON数据，不要包含任何解释或额外文本。格式示例：{"name":"王五","goods":"h_dou_jiao","address":1}'
+        )
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": system_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+            ],
+        }]
+        try:
+            response = client.chat.completions.create(
+                model=image_model,
+                messages=messages,
+                extra_body={"stream": False},
+                top_p=0.1,
+                timeout=15.0,
+            )
+            content = response.choices[0].message.content
+        except Exception as e:
+            print(f"[WARN] {tag}大模型请求失败: {type(e).__name__}: {e}")
+            return
+
+        # 优先按纯 JSON 解析，失败再尝试提取 ```json 代码块
+        order = None
+        try:
+            order = json.loads(content)
+        except Exception:
+            order = my_car.order_analysis.get_json_str(content)
+
+        if isinstance(order, dict) and "address" in order:
+            # 若识别为"控"，则将姓名设为"未知"，后续不抓取
+            if "控" in str(order.get("name", "")):
+                order["name"] = "未知"
+                print(f"[INFO] {tag}识别到'控'，姓名设为'未知'，将跳过抓取")
+            formated_orders.append(order)
+            print(f"[INFO] {tag}大模型识别完成: {order}")
+        else:
+            print(f"[WARN] {tag}大模型识别结果非预期格式: {type(order).__name__} = {order}")
+
+    # 随机订单：拍摄并保存 order_1.jpg，后台线程识别（不阻塞后续机械臂动作）
+    stage_started = time.monotonic()
+    order1_path = _capture_order_image("order_1.jpg")
+    perf_log("随机订单拍照", stage_started, f"success={order1_path is not None}")
+    #记录执行时的位置
+    pose1=my_car.get_odometry()
+
+
+    thread1 = None
+    if order1_path is not None:
+        thread1 = threading.Thread(target=_recognize_order_image, args=(order1_path, "随机订单"), daemon=True)
+        thread1.start()
+
+    # 抬起机械臂准备识别固定订单（随机订单的大模型识别在后台并行进行）
+    stage_started = time.monotonic()
+    my_car.arm.move_y_position(0.22)
+    my_car.arm.move_y_position(0.22)
+    arm_move_list=[
+        threading.Thread(target=my_car.arm.move_x_position,args=(0.2,),daemon=True),
+        threading.Thread(target=my_car.arm.move_x_position,args=(0.2,),daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle,args=("RIGHT",),daemon=True),
+        threading.Thread(target=my_car.arm.set_arm_angle,args=("RIGHT",),daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle,args=(-40,),daemon=True),
+        threading.Thread(target=my_car.arm.set_hand_angle,args=(-40,),daemon=True)
+    ]    
+    for _t in arm_move_list:
+        _t.start()
+    # my_car.arm.set_arm_pose(y=0.22)
+    # my_car.arm.set_arm_pose(x=0.2)
+    # my_car.arm.set_arm_pose(arm="RIGHT", hand=-40)
+    for _t in arm_move_list:
+        _t.join()
+    perf_log("固定订单识别姿态", stage_started)
+
+    # 固定订单：拍摄并保存 order_2.jpg，后台线程识别（机械臂刚转完，稍作稳定）
+    stage_started = time.monotonic()
+    order2_path = _capture_order_image("order_2.jpg", settle_seconds=0.5)
+    perf_log("固定订单拍照", stage_started, f"success={order2_path is not None}")
+    thread2 = None
+    if order2_path is not None:
+        thread2 = threading.Thread(target=_recognize_order_image, args=(order2_path, "固定订单"), daemon=True)
+        thread2.start()
+
+
+
+    ###扫描货物
+    # 向前移动到第一个商品货架位置
+    my_car.move_for([SHELF_DISTANCE, 0, 0])
+    # 抬起球仓，放置干扰货物存放
+    my_car.arm.set_arm_pose(arm="RIGHT", hand="DOWN")
+    my_car.arm.set_arm_pose(arm="RIGHT", hand="DOWN")
+    # ===== 边扫边抓：先拿到订单目标，再遍历货架位置，发现就当场抓 =====
+    # 等待两个后台识别线程完成（前进+摆姿态期间它们已在并行识别）
+    for t in (thread1, thread2):
+        if t is not None:
+            t.join()
+
+    # 对订单列表进行排序，将2号楼的订单排在前面优先拿取，这样2号楼就会靠后配送
+    # address 由大模型返回，可能混有 str('1') 与 int(1)，统一转字符串再比较，避免 sort 崩溃
+    formated_orders.sort(key=lambda x: str(x["address"]))
+
+    def resolve_goods_label(goods, fallback):
+        """把订单中的 goods 归一化为项目视觉识别使用的英文标签。
+
+        兼容两种情况：goods 已是英文标签（如 "h_qin_cai"）则直接返回；
+        若是中文名（如 "芹菜"）则经 GOODS_LABEL_DICT 映射；其余情况返回 fallback。
+        """
+        if goods in GOODS_LABEL_DICT:
+            return GOODS_LABEL_DICT[goods]
+        if goods in GOODS_LABEL_DICT.values():
+            return goods
+        return fallback
+
+    # 获取第一个和第二个目标商品标签（带默认值保护）
+    first_target_good_label = resolve_goods_label(
+        formated_orders[0]["goods"], "未知"
+    ) 
+    second_target_good_label = resolve_goods_label(
+        formated_orders[1]["goods"], "未知"
+    )
+
+    # 姓名"未知"的商品跳过抓取（识别到"控"时 name 被置为"未知"）
+    skip_first = formated_orders[0].get("name") == "未知"
+    skip_second = formated_orders[1].get("name") == "未知"
+    if skip_first:
+        print(f"[抓取] 第一个订单姓名为'未知'，跳过抓取")
+    if skip_second:
+        print(f"[抓取] 第二个订单姓名为'未知'，跳过抓取")
+
+
+    # ===== 边扫边抓循环：遍历货架位置，发现订单蔬菜就当场对准抓取 =====
+    print("\n[抓取] ===== 边扫边抓目标商品 =====")
+    # 剩余待抓目标集合（"未知"订单不加入；抓到就从集合移除，天然去重、不限定先后）
+    remaining = set()
+    if not skip_first:
+        remaining.add(first_target_good_label)
+    if not skip_second:
+        remaining.add(second_target_good_label)
+    car_at_second_col = False  # 从第一列开始遍历
+
+    def goto_scan_position(pos_idx):
+        """导航到指定的扫描位置（含切列）"""
+        nonlocal car_at_second_col
+        target_is_second = pos_idx >= 2
+        if target_is_second and not car_at_second_col:
+            my_car.move_for([COLUMN_SPACING, 0, 0])
+            car_at_second_col = True
+        elif not target_is_second and car_at_second_col:
+            my_car.move_for([-COLUMN_SPACING, 0, 0])
+            car_at_second_col = False
+        my_car.arm.set_arm_pose(**PREALIGN_PARAMS_FOR_SEARCHING[pos_idx])
+        my_car.arm.set_arm_pose(**PREALIGN_PARAMS_FOR_SEARCHING[pos_idx])
+
+    scan_started = time.monotonic()
+    for i, params in enumerate(PREALIGN_PARAMS_FOR_SEARCHING):
+        if not remaining:  # 全部抓完，提前结束
+            break
+
+        position_started = time.monotonic()
+        goto_scan_position(i)
+        results = my_car.get_detection_results(update_stream=False)
+        detected_labels = {result[2] for result in results}
+        print(f"[扫描] 位置{i} (x={params['x']}, y={params['y']}) 看到: {sorted(detected_labels)}")
+        perf_log(f"货架位置[{i}]扫描", position_started)
+
+        # 本格里还剩下要抓的目标（不限定先后，看到谁抓谁）
+        targets_here = remaining & detected_labels
+
+        while targets_here:
+            target = targets_here.pop()
+            good_started = time.monotonic()
+            print(f"[抓取] 商品 {target} → 位置{i}")
+            my_car.move_to_detection_target2(
+                label=target,
+                delta_y=None,
+                time_out=DETECT_TIMEOUT,
+                save_images=False,
+                success_beeps=0,
+                update_stream=False,
+            )
+            pick_and_place_good(False, target)
+            remaining.discard(target)  # 抓到就移除，不会重复抓、不会抓错
+            perf_log(f"商品总计[{target}]", good_started)
+
+            # 抓完一个回本格扫描姿态重拍，重新找剩余目标（不直接跳下一格）
+            goto_scan_position(i)
+            time.sleep(1)
+            still_here = {r[2] for r in my_car.get_detection_results(update_stream=False)}
+            targets_here = remaining & still_here
+
+    # 遍历结束仍未抓到的商品，报错提示（不影响后续流程）
+    for g in sorted(remaining):
+        print(f"[ERROR] 遍历结束未抓到商品 {g}")
+
+    perf_log("货架边扫边抓总计", scan_started)
+    my_car.arm.move_x_position(0)
+
+    # 退回订单机前先初始化机械臂（复位 x/y、手 UP、臂 RIGHT），避免残留抓取姿态影响退回与后续配送
+
+    my_car.arm.reset_position()
+    my_car.arm.reset_position()
+
+    my_car.move_to_position(pose1)
+
+    perf_log("任务总计", task_started)
+
+    return formated_orders
+
+
+
+def order_delivery(
+        order_list = [
+            {"name": "李四", "goods": "芹菜", "address": 2},
+            {"name": "钱七", "goods": "青椒", "address": 2},
+        ],
+        debug=False
+     ):
+    """
+    订单配送
+
+    :param order_list: 订单列表，每个订单包含姓名、商品和地址
+    :param debug: 是否开启调试模式
+    :return: None
+
+    核心逻辑：
+    1. 初始化机械臂搜索姿态
+    2. 根据是否为调试模式，设置不同的距离，自动巡航到第一栋楼附近
+    3. 依次遍历2栋楼所有房间
+    4. 按照拿取顺序的倒序将货物进行配送
+    5. 任务结束后先前一直巡航回到基地
+    """    
+    ################################## 常量定义 ##################################
+    # 搜索时的机械臂姿态参数
+    SEARCHING_POSE ={
+        'x': 0.10,
+        'y': 0.15,
+        'arm': "LEFT",
+        'hand': "UP"
+    }
+
+    # 搜索时的机械臂姿态参数
+    ARM_X_FOR_SEARCHING = 0.135           # 搜索时的机械臂x轴位置
+    ARM_Y_FOR_SEARCHING_UPPER = 0.15      # 搜索时的机械臂y轴位置（上层）
+    ARM_Y_FOR_SEARCHING_LOWER = 0.06      # 搜索时的机械臂y轴位置（下层）
+    ROOM_WIDTH = 0.12                     # 房间的宽度
+
+    # 搜索时的机械臂姿态参数，用于遍历2栋楼的所有房间
+    PARAMS_FOR_SEARCHING_BUILDING = [
+
+        {
+            'arm_x':ARM_X_FOR_SEARCHING,
+            'arm_y':ARM_Y_FOR_SEARCHING_UPPER,
+            'offset_x': 0.0
+        },
+        {
+            'arm_x':ARM_X_FOR_SEARCHING,
+            'arm_y':ARM_Y_FOR_SEARCHING_UPPER,
+            'offset_x': ROOM_WIDTH
+        },
+        {
+            'arm_x':ARM_X_FOR_SEARCHING,
+            'arm_y':ARM_Y_FOR_SEARCHING_UPPER,
+            'offset_x': ROOM_WIDTH
+        },
+        {
+            'arm_x':ARM_X_FOR_SEARCHING,
+            'arm_y':ARM_Y_FOR_SEARCHING_LOWER,
+            'offset_x': 0.0
+        },
+        
+        {
+            'arm_x':ARM_X_FOR_SEARCHING,
+            'arm_y':ARM_Y_FOR_SEARCHING_LOWER,
+            'offset_x': -ROOM_WIDTH
+        },
+        {
+            'arm_x':ARM_X_FOR_SEARCHING,
+            'arm_y':ARM_Y_FOR_SEARCHING_LOWER,
+            'offset_x': -ROOM_WIDTH
+        },
+    ]
+
+    ################################## 函数定义 ##################################
+    def grasp_and_place_good(is_first_good_picked, floor):
+        """拾取商品并放置"""
+        my_car.arm.grasp(True)
+        my_car.arm.grasp(True)
+        my_car.arm.set_arm_pose(arm=-115, hand="DOWN")
+        my_car.arm.set_arm_pose(arm=-115, hand="DOWN")
+        my_car.arm.set_arm_pose(x=0.05, y=0.06  if is_first_good_picked else 0.10)
+        my_car.arm.set_arm_pose(x=0.05, y=0.06  if is_first_good_picked else 0.10)
+        my_car.arm.move_y_position(y= 0.18 if floor == "upper" else 0.10)
+        my_car.arm.move_y_position(y= 0.18 if floor == "upper" else 0.10)
+        my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+        my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+        my_car.arm.move_y_position(0.12)
+        my_car.arm.move_y_position(0.12)
+        my_car.arm.move_y_position(0.08)
+        my_car.arm.move_y_position(0.08)
+        my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+        my_car.arm.set_arm_pose(arm="LEFT", hand=-70)
+        my_car.arm.grasp(False)
+        my_car.arm.grasp(False)
+
+    def search_building_by_names(names):
+        # 初始化状态变量，用于控制搜索过程
+        first_name = names[0]           # 第一个商品的收货人姓名
+        second_name = names[1]          # 第二个商品的收货人姓名
+
+        is_first_good_placed = False    # 第一个商品是否已经配送
+        is_second_good_placed = False   # 第二个商品是否已经配送
+
+        second_good_loc = None          # 第二个商品的位置  
+        second_good_arm_y = None        # 第二个商品的机械臂y轴位置
+
+        
+        # 遍历2栋楼的所有房间
+        for building_id in range(2):
+            # 如果遍历索引值为1，说明当前是第二栋楼，需要向前移动到第二栋楼的位置
+            if building_id == 1:
+                my_car.move_for([0.55, 0, 0])
+            # 如果第一个商品第二个商品都拾取了，说明已经完成搜索，跳出循环
+            if is_first_good_placed and is_second_good_placed:
+                return
+            # 遍历当前栋楼的所有房间
+            for i, params in enumerate(PARAMS_FOR_SEARCHING_BUILDING):
+                arm_x, arm_y = params["arm_x"], params["arm_y"]
+                my_car.arm.set_arm_pose (x=arm_x, y=arm_y)
+                my_car.arm.set_arm_pose (x=arm_x, y=arm_y)
+                offset_x = params["offset_x"]
+                my_car.move_for([offset_x, 0, 0])
+                my_car.move_to_detection_target(delta_y=None)
+
+                name = my_car.get_ocr(label="name")
+
+                # 处理第一个要配送的货物
+                # 直接配送第一个商品，然后检查是否有第二个商品的检索位置，如果有则配送第二个商品
+                if name == first_name:
+                    floor = "upper" if i//3 == 0 else "lower"
+                    grasp_and_place_good(is_first_good_placed, floor)
+                    is_first_good_placed = True
+
+                    if second_good_loc is not None:
+                        my_car.move_to_position(second_good_loc)
+                        my_car.arm.set_arm_pose(x=0.05, y=second_good_arm_y)
+                        my_car.arm.set_arm_pose(x=0.05, y=second_good_arm_y)
+                        my_car.move_to_detection_target()
+                        grasp_and_place_good(is_second_good_placed, floor)
+                        is_second_good_placed = True
+                    continue
+                
+                # 处理第二个要配送的货物
+                # 如果第一个已经配送了，则直接配送第二个商品，否则记录第二个商品的检索位置
+                if name == second_name:
+                    if is_first_good_placed:
+                        grasp_and_place_good(is_second_good_placed, 2 if i//3 == 0 else 1)
+                        is_second_good_placed = True
+                        if is_first_good_placed and is_second_good_placed:
+                            return
+                    else:
+                        second_good_loc =  my_car.get_odometry(True)
+                        second_good_arm_y = arm_y
+                        continue
+    ################################## 任务流程 ##################################
+    my_car.arm.set_arm_pose(**SEARCHING_POSE)
+    my_car.arm.set_arm_pose(**SEARCHING_POSE)
+    names = [order["name"] for order in order_list]
+    my_car.move_to_detection_target(delta_y=None)
+    search_building_by_names(names)
+   
+    ################################# 调试模式 ##################################
+    my_car.move_to_position([0.0, 0.0, 0.0]) if debug else  my_car.lane_dis_offset(speed=0.3, dis_hold=4.0) 
+
+def TowerMoveToShooting():
+    my_car.lane_dis_offset(speed=0.25, dis_hold=2.2)
+    my_car.lane_dis_offset(speed=0.2, dis_hold=0.9)
+    my_car.lane_dis_offset(speed=0.25, dis_hold=0.7)
+    my_car.lane_dis_offset(speed=-0.25,dis_hold=0.63)
+
+def insect_analysis_task():
+    """
+    昆虫益害分析任务。
+    读取 animal_pic 文件夹下的所有图片，为每张图片开启一个新线程，
+    调用大模型 (ERNIE-VL) 从左往右识别每个昆虫是益虫(1)还是害虫(0)。
+    """
+    import json
+    import base64
+
+    # 图片文件夹路径固定在 Pyy1 内，与打靶拍照保存目录保持一致
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "animal_pic")
+    if not os.path.isdir(save_dir):
+        print("[昆虫分析] 未找到 animal_pic 文件夹")
+        return []
+
+    image_paths = sorted(
+        os.path.join(save_dir, name)
+        for name in os.listdir(save_dir)
+        if name.lower().endswith((".jpg", ".jpeg", ".png"))
+    )
+    if not image_paths:
+        print("[昆虫分析] animal_pic 文件夹下没有图片")
+        return []
+
+    results = [None] * len(image_paths)
+    result_lock = threading.Lock()
+
+    def _analyze_photo(photo_index, image_path):
+        """在线程中读取单张图片并分析，识别图中所有昆虫并返回左右有序的数组。"""
+        try:
+            image_bgr = cv2.imread(image_path)
+            if image_bgr is None:
+                print(f"[昆虫分析] 第{photo_index + 1}张图片读取失败: {image_path}")
+                with result_lock:
+                    results[photo_index] = []
+                return
+
+            ok, img_encoded = cv2.imencode(".jpg", image_bgr)
+            if not ok:
+                print(f"[昆虫分析] 第{photo_index + 1}张图片 JPEG 编码失败")
+                with result_lock:
+                    results[photo_index] = []
+                return
+
+            base64_image = base64.b64encode(img_encoded.tobytes()).decode("utf-8")
+
+            system_prompt = (
+                "必须返回一个合法的 JSON 对象，不要包含任何 Markdown 标记（如 ```json）、代码块符号或其他解释性文字。\n"
+                "从左往右依次识别图中每一个可见昆虫，不得遗漏或重复。\n"
+                "可能存在的昆虫有：蝗虫、螳螂、蜜蜂、瓢虫、玉米螟、菜粉蝶等。\n"
+                "JSON 必须且仅包含以下两个字段：\n"
+                '"results": 整数数组，长度等于图中昆虫数量。数组下标严格对应从左到右的昆虫顺序；值为 1 表示该位置昆虫为益虫，值为 0 表示为害虫。\n'
+                '"analysis": 字符串类型，详细描述分析过程。需按从左到右的顺序逐一说明：1.昆虫种类名称；2.判定依据（必须严格基于描述中可见的特征，如啃食叶片、结网捕虫、访花行为、体色、触角形状、幼虫伴随情况或图片片子是否出现昆虫咬食状态等）；3.该昆虫在农业或生态系统中的典型作用（如捕食蚜虫、传播病害、授粉等）。\n'
+                '案例：若识别出蝗虫（啃食叶片）、螳螂（捕食姿态）、蜜蜂（访花）、瓢虫（典型体色），蜘蛛(益虫)应返回 results:[0,1,1,1]，并在 analysis 中分别阐述其危害或益处及依据。'
+            )
+
+            client = my_car.image_analysis.client
+            image_model = my_car.image_analysis.image_model
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": system_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        },
+                    },
+                ],
+            }]
+
+            response = client.chat.completions.create(
+                model=image_model,
+                messages=messages,
+                extra_body={"stream": False},
+                top_p=0.1,
+                timeout=30.0,
+            )
+
+            content = response.choices[0].message.content
+            data = json.loads(content)
+            photo_results = data.get("results", [])
+
+            with result_lock:
+                results[photo_index] = photo_results
+
+            print(f"[昆虫分析] 第{photo_index + 1}张照片分析完成: {data}")
+
+        except Exception as e:
+            print(f"[昆虫分析] 第{photo_index + 1}张照片分析失败: {type(e).__name__}: {e}")
+            with result_lock:
+                results[photo_index] = []
+
+    # ---- 为每张图片开启一个分析线程 ----
+    threads = []
+    for i, path in enumerate(image_paths):
+        print(f"[昆虫分析] 启动第{i + 1}张图片分析: {os.path.basename(path)}")
+        t = threading.Thread(target=_analyze_photo, args=(i, path), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # ---- 等待所有分析线程完成 ----
+    for t in threads:
+        t.join()
+
+    
+    return results
+
+
+
+
+
+
+if __name__ == "__main__":
+    init()
+    ####昆虫测试
+    # # target_shooting_detection2()
+    
+    # #     # 昆虫益害分析：后台线程调用大模型，不阻塞后续任务
+    # analysis_result = []
+
+    # def _run_analysis():
+    #     analysis_result.append(insect_analysis_task())
+
+    # analysis_thread = threading.Thread(target=_run_analysis, daemon=True)
+    # analysis_thread.start()
+    # analysis_thread.join()
+    # insect_results = analysis_result[0] if analysis_result else [1]
+    # insect_results = [v for per_photo in insect_results for v in (per_photo or [])]
+
+    #get_order1()
+    """
+    my_car.arm.reset_position()
+    my_car.arm.reset_position()
+    my_car.reset_position()
+    my_car.lane_dis_offset(speed=0.6, dis_hold =1.72,mode=4)
+    my_car.align_lane_heading(duration=4)
+    water_tower_task_3()
+    """
+    #第二种过大弯的方案
+    """
+    my_car.lane_dis_offset(speed=0.6, dis_hold = 2.25,mode=4)    
+    my_car.move_distance([0.4,0,-1.5],0.53)
+    my_car.lane_dis_offset(speed=0.35, dis_hold = 3,mode=4)
+    """
+    ####完整任务
+    ###种植任务
+    # get_order()
+    my_car.lane_dis_offset(speed=0.6,dis_hold=0.85,mode=4)
+    auto_seeding_2()
+    my_car.lane_dis_offset(speed=0.6, dis_hold=1.6,mode=4)
+    my_car.arm.set_arm_angle("LEFT")
+    my_car.arm.set_arm_angle("LEFT")
+    # 打靶拍照：侧摄像头拍摄 1.jpg、2.jpg 保存到 animal_pic 文件夹
+    target_shooting_detection2()
+ 
+
+    # 昆虫益害分析：后台线程调用大模型，不阻塞后续任务
+    analysis_result = []
+
+    def _run_analysis():
+        analysis_result.append(insect_analysis_task())
+
+    analysis_thread = threading.Thread(target=_run_analysis, daemon=True)
+    analysis_thread.start()
+
+    #后续任务（分析在后台进行，不阻塞这里）
+    # 水塔任务
+    my_car.arm.reset_position()
+    my_car.arm.reset_position()
+    my_car.reset_position()
+    my_car.lane_dis_offset(speed=0.6, dis_hold =1.72,mode=4)
+    my_car.align_lane_heading(duration=4)
+    water_tower_task_5()
+    # # ###水塔后巡线模拟
+    my_car.lane_dis_offset(speed=0.6,dis_hold=2.2,mode=4)
+    my_car.lane_dis_offset(speed=0.4,dis_hold=0.8,mode=4)
+    my_car.move_for([-0.1,0,0])
+    # # #打击定位
+    my_car.arm.move_y_position(0.1)
+    my_car.arm.move_y_position(0.1)
+    my_car.arm.set_arm_angle("LEFT")
+    my_car.arm.set_arm_angle("LEFT")
+    my_car.arm.set_hand_angle("DOWN")
+    my_car.arm.set_hand_angle("DOWN")
+    cls_id, label= my_car.move_to_detection_target(time_out=10.0,pid_params={"LEFT": {"kp_x": 0.05, "kp_y": 0.00}})
+    # ##保存
+    pose=my_car.get_odometry()
+
+    analysis_thread.join()
+    insect_results = analysis_result[0] if analysis_result else [1]
+    insect_results = [v for per_photo in insect_results for v in (per_photo or [])]
+    print(insect_results)
+    target_shooting(insect_results)
+    
+    my_car.move_to_position(pose,lateral_enabled=False)
+    # ###任务小球
+
+    # ###抓小球
+
+    # ###放小球
+
+    # ###抓蔬菜
+    # 机械臂复位放后台执行（reset_x 最长约8s），不阻塞后面的巡线
+    reset_thread = threading.Thread(target=my_car.arm.reset_position, daemon=True)
+    reset_thread = threading.Thread(target=my_car.arm.reset_position, daemon=True)
+    reset_thread.start()
+
+    my_car.reset_position()   # 里程计复位瞬时，必须同步执行，放后台会跟巡线抢里程计基准
+
+    my_car.lane_dis_offset(speed=0.6,dis_hold=1.7,mode=4)
+    my_car.lane_dis_offset(speed=0.4,dis_hold=0.6,mode=4)
+    my_car.lane_dis_offset(speed=0.6, dis_hold = 2.0,mode=4)
+    my_car.lane_dis_offset(speed=0.4,dis_hold=0.6,mode=4)
+    my_car.lane_dis_offset(speed=0.6, dis_hold =1.7,mode=4)
+    # reset_thread.join()   # 用机械臂前确保复位完成
+    my_car.arm.reset_position()
+    my_car.arm.reset_position()
+    my_car.reset_position()
+    get_order1()
+
+    my_car.lane_dis_offset(0.6,dis_hold=0.98,mode=4)
+    my_car.move_for([0.0,0.0,-math.pi *5/9])
+    my_car.lane_dis_offset(speed=0.4, dis_hold = 1.6,mode=4)
+    my_car.lane_dis_offset(speed=0.9, dis_hold = 3,mode=4)
+
+
+    # my_car.arm.reset_position()
+    # my_car.reset_position()
+    # my_car.lane_dis_offset(speed=0.6, dis_hold = 1.6,mode=4)
+    # my_car.align_lane_heading(duration=4)
+    # water_tower_task_3() 
+    # my_car.lane_dis_offset(speed=0.6,dis_hold=2.5,mode=4)
+    # my_car.lane_dis_offset(speed=0.1,dis_hold=0.16,mode=1)
+    # save_pos = my_car.get_odometry()
+    # print(f"[记录位置] 打靶前位置: {save_pos}")
+    # target_shooting(animal_list)
+    # print(f"[返回位置] 回到打靶前位置: {save_pos}")
+    # my_car.move_to_position(save_pos)
+    # my_car.lane_dis_offset(speed=0.6, dis_hold=1.6,mode=1)
+    # my_car.lane_dis_offset(speed=0.6, dis_hold=0.9,mode=4)
+    # my_car.lane_dis_offset(speed=0.7, dis_hold=1.8,mode=1)
+    # my_car.lane_dis_offset(speed=0.6, dis_hold=0.9,mode=4)
+    # my_car.lane_dis_offset(speed=0.45, dis_hold=1.4,mode=1)
+    # #my_car.lane_dis_offset(speed=0.3, dis_hold=0.6,mode=4)
+    # my_car.lane_dis_offset(speed=0.2, dis_hold=0.7,mode=1)
+    # my_car.arm.reset_position()
+    # my_car.reset_position()
+    # get_order1(debug=False)
+    # my_car.lane_dis_offset(speed=0.6, dis_hold=2.9,mode=4)
+    # my_car.lane_dis_offset(speed=0.7, dis_hold=50,mode=1)
+
+
+    # 华科版巡线
+"""
+    my_car.lane_dis_offset(speed=0.6, dis_hold = 6.95,mode=4)
+    my_car.lane_dis_offset(speed=0.4,dis_hold=0.6,mode=4)
+    my_car.lane_dis_offset(speed=0.6, dis_hold = 1.8,mode=4)
+    my_car.lane_dis_offset(speed=0.4,dis_hold=0.6,mode=4)
+    my_car.lane_dis_offset(speed=0.6, dis_hold = 2.08,mode=4)
+    my_car.lane_dis_offset(speed=0.4,dis_hold=0.6,mode=4)
+    my_car.lane_dis_offset(speed=0.6, dis_hold = 2.65,mode=4)
+    my_car.move_for([0.0,0.0,-math.pi *5/9])
+    my_car.lane_dis_offset(speed=0.4, dis_hold = 1.6,mode=4)
+    my_car.lane_dis_offset(speed=1, dis_hold = 3,mode=4)
+"""
+ 
+# 水塔调试
+   #my_car.arm.reset_position()
+   #my_car.reset_position()
+   #my_car.lane_dis_offset(speed=0.3, dis_hold = 1.95,mode=4)
+   #my_car.align_lane_heading(duration=4)
+   #water_tower_task_3()
+    # while True: 
+    #     my_car.shooting()
+    #     time.sleep(5)
+    # my_car.lane_dis_offset(speed=0.6, dis_hold=99,mode=4)
+# 总代码
+
+
+
+

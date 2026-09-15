@@ -1,0 +1,275 @@
+# ============================================================
+# 以下为硬件配置，供 car_main.py 导入使用
+# ============================================================
+#
+# 通用字段说明：
+#   wbt_car  - 车型版本号，用于标识小车硬件型号
+#
+# camera - 摄像头配置
+#   front  - 前视摄像头编号（对应视频捕获通道）
+#   side   - 侧视摄像头编号
+#
+# io - 通用 IO 引脚配置（WhalesBot 主板引脚编号） 
+#   left_sensor  - 左侧传感器引脚（用于检测左侧障碍物或边界）, 2026年未使用，预留接口
+#   right_sensor - 右侧传感器引脚（用于检测右侧障碍物或边界），2026年未使用，预留接口
+#   key         - 按键引脚（用于物理按键输入）
+#   light       - 灯光控制引脚（控制车灯或其他指示灯），2026年未使用，预留接口
+#
+# speed - 速度限制配置
+#   x     - 横向（左右）速度限制，单位：m/s
+#   y     - 纵向（前后）速度限制，单位：m/s
+#   angle - 角速度限制，单位：rad/s
+#
+# ============================================================
+
+wbt_car: 0.1
+camera:
+  front: 0
+  side: 2
+
+  # 两路软件自动曝光独立开关：0=完全不读写曝光控件；1=尝试启用。
+  # 首次上车必须保持 0。只有填好对应相机的安全曝光上限后才能设为 1。
+  front_auto_exposure: 0
+  side_auto_exposure: 0
+
+  exposure:
+    # cap_front / /dev/video0：水块、水塔与任务目标相机
+    front:
+      roi: [0.08, 0.08, 0.92, 0.92]
+      target_luma: 120
+      deadband: 8
+      adjust_every_frames: 10
+      outside_need: 2
+      settle_frames: 6
+      ema_alpha: 0.20
+      highlight_ratio: 0.15
+      shadow_ratio: 0.35
+      # 必须依据 /dev/video0 实测填写；null 时即使开关为 1 也拒绝启用。
+      exposure_max_override: 157
+      adjust_gain: 0
+      gain_max_override: null
+      runtime_control_timeout: 0.12
+      set_50hz: 1
+      debug: 0
+
+    # cap_side / /dev/video2：循迹相机；ROI 只统计下方赛道区域。
+    side:
+      roi: [0.05, 0.55, 0.95, 0.90]
+      target_luma: 95
+      deadband: 8
+      adjust_every_frames: 15
+      outside_need: 2
+      settle_frames: 8
+      ema_alpha: 0.20
+      highlight_ratio: 0.30
+      shadow_ratio: 0.40
+      # 循迹必须优先限制运动模糊，需独立实测 /dev/video2 的安全上限。
+      exposure_max_override: 120
+      adjust_gain: 0
+      gain_max_override: null
+      runtime_control_timeout: 0.08
+      set_50hz: 1
+      debug: 0
+
+# 只控制日志与调试输出，不改变 PID、识别阈值、模型或机械臂动作。
+performance:
+  # 1=输出 target/get_order/OCR/视觉对准的分段耗时；0=关闭计时日志。
+  timing_log: 1
+  # 比赛默认不逐帧写巡线 JPEG，避免占用 CPU、存储带宽并持续填盘。
+  save_lane_debug_images: 0
+  # 巡线模式4拍照：1=开启，每 lane_photo_interval 帧保存一张带模型误差标注的照片；0=关闭。
+  save_lane_photo: 1
+  lane_photo_interval: 1
+  # get_order1 抓取前调试图；开启后会额外做一次 task 推理并写 JPEG。
+  save_grasp_debug_images: 0
+  # 0=正常双向巡线  1=禁止左拐  2=禁止右拐
+  disable_left_turn: 0
+
+# ============================================================
+# 颜色鲁棒化旁路验证配置（国赛版）
+# 仅用于水块/小球颜色中心链路；循迹链路暂未接入。
+# 所有参数都用 .get() 读取并有默认值，旧 YAML 缺少本节点时保持原行为。
+# ============================================================
+vision_color_robust:
+  object:
+    # mode: 0=完全关闭，1=旁路比较但仍使用旧结果，2=新结果合格时使用并保留旧算法回退
+    mode: 2
+    save_debug: 1
+    log_every_frames: 10
+    seed_distance: 0.18
+    grow_distance: 0.36
+    min_seed_pixels: 8
+    min_seed_saturation: 10
+    min_grow_saturation: 10
+    min_component_area: 80
+    max_component_area_ratio: 0.45
+    max_shape_center_gap_px: 12
+    max_previous_center_gap_px: 140
+    targets:
+      # 初始值仅用于 mode=1 旁路，必须用真实任务位置图重新标定
+      light_blue:
+        hsv_samples: [[100, 31, 127], [100, 40, 150], [100, 62, 175]]
+        roi: [0.0, 0.15, 1.0, 1.0]
+        shape: rectangle
+      dark_blue:
+        hsv_samples: [[105, 160, 90], [112, 190, 130], [118, 130, 170]]
+        roi: [0.10, 0.20, 0.90, 0.80]
+        shape: circle
+      yellow:
+        hsv_samples: [[23, 160, 130], [30, 190, 180], [37, 150, 210]]
+        roi: [0.10, 0.20, 0.90, 0.80]
+        shape: circle
+      red:
+        # 红色跨越 OpenCV H=0/180，必须保留两侧样本
+        hsv_samples: [[2, 190, 180], [178, 190, 180]]
+        roi: [0.0, 0.25, 1.0, 1.0]
+        shape: circle
+      gray:
+        # 灰色低饱和，后续距离函数必须忽略 H，主要比较 S/V
+        hsv_samples: [[0, 15, 90], [0, 25, 130]]
+        roi: [0.0, 0.25, 1.0, 0.80]
+        shape: rectangle
+
+io:
+  left_sensor: 8
+  right_sensor: 7
+  key: 1
+  light: 2
+speed:
+  x:
+    limit: 0.7
+  y:
+    limit: 0.7
+  angle:
+    limit: 3
+
+# ============================================================
+# PID 参数配置，供 car_main.py 导入使用
+# ============================================================
+#
+# PID 通用字段说明：
+#   Kp           - 比例系数，用于响应当前误差
+#   Ki           - 积分系数，用于消除稳态误差
+#   Kd           - 微分系数，用于抑制误差变化
+#   setpoint     - 目标值（期望值）
+#   output_limits - PID 输出限幅 [最小值, 最大值]
+#
+# ============================================================
+
+# 巡线 PID - 用于车道线巡航控制
+lane_pid:
+  cfg_pid_y:
+    Kp: 0.5
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-0.7, 0.7]
+  cfg_pid_angle:
+    Kp: 2.0
+    Ki: 0
+    Kd: 0.05
+    setpoint: 0
+    output_limits: [-1.5, 1.5]
+
+  # 纯横向误差→角度修正 PID（备用方案）
+  # 输入 error_y（横偏），输出角速度，不依赖 AI 角度
+  cfg_pid_lat_angle:
+    Kp: 35.0
+    Ki: 0
+    Kd: 6
+    setpoint: 0
+    output_limits: [-1.2, 1.2]
+
+# 检测巡航 PID - 用于目标检测后的跟随控制
+det_pid:
+  cfg_pid_y:
+    Kp: 1
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-0.7, 0.7]
+  cfg_pid_angle:
+    Kp: 1
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-1.5, 1.5]
+
+# 定位 PID - 用于精确定位和位置控制
+location_pid:
+  pid_x:
+    Kp: -2
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-0.7, 0.7]
+  pid_y:
+    Kp: -2
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-0.7, 0.7]
+
+
+# ============================================================
+# 以下为推理服务配置 文件，供 infer_back_end.py 和 infer_front.py 导入使用
+# ============================================================
+#
+# 通用字段说明：
+#   name        - 推理实例的唯一标识，供前端 ClintInterface 调用时使用
+#   infer_type  - 推理类名，必须与 infer_wrap.py 中定义的类名一致
+#                 可选值：YoloeInfer, YolovxInfer, YoloeRInfer, LaneInfer,
+#                         HummanAtrr, MotHuman, OCRReco
+#   model_dir   - 模型文件夹路径（相对于 infer_wrap.py 同级目录），
+#                 文件夹内应包含 *.pdmodel 和 *.pdiparams 文件
+#   port        - ZMQ 服务端口，前端通过该端口连接推理后端
+#   img_size    - 输入图像缩放分辨率，Null 表示不缩放
+#   run_mode    - 推理运行模式，可选值：
+#                 paddle  - 使用 Paddle Inference CPU/GPU 原生推理
+#                 trt_fp32 - TensorRT FP32 推理（需先导出 TensorRT 模型）
+#                 trt_fp16 - TensorRT FP16 推理
+#
+# OCR 特殊说明：
+#   OCR（OCRReco）采用两阶段模型架构，需要单独配置：
+#     det_model_dir - 检测模型目录，用于定位图像中的文字区域
+#     rec_model_dir - 识别模型目录，用于将检测到的文字区域识别为文本
+#   img_size 对 OCR 无效，OCR 会自动对输入图像进行长边缩放
+#
+# ============================================================
+
+infer_cfg:
+  - name: lane
+    infer_type: LaneInfer
+    model_dir: lane_model
+    port: 5001
+    img_size: [128, 128]
+    run_mode: paddle
+
+  - name: task
+    infer_type: YoloeInfer
+    model_dir: task2026
+    port: 5002
+    img_size: [416, 416]
+    run_mode: paddle
+
+  - name: front
+    infer_type: YoloeInfer
+    model_dir: front_model2
+    port: 5003
+    img_size: [416, 416]
+    run_mode: paddle
+
+  - name: ocr
+    infer_type: OCRReco
+    # OCR 使用两阶段模型：检测(det) + 识别(rec)
+    det_model_dir: ch_PP-OCRv3_det_infer
+    rec_model_dir: ch_PP-OCRv3_rec_infer
+    port: 5004
+    img_size: Null
+    run_mode: paddle
+
+# ============================================================
+# 文心一言 Access Token 配置
+# 获取地址：https://aistudio.baidu.com/account/accessToken
+# ============================================================
+ernie_access_token: YOUR_ERNIE_ACCESS_TOKEN

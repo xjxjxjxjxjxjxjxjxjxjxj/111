@@ -1,0 +1,1 @@
+- [Ask before editing](.claude/memory/user-preference-ask-before-edit.md) — 代码改动前必须先取得用户同意

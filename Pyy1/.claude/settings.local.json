@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /home/jetsonjetson/WorkSpace2026/baidu_smartcar_2026/smartcar/)",
+      "Read(//home/jetsonjetson/WorkSpace2026/baidu_smartcar_2026/smartcar/**)",
+      "Bash(ls /home/jetsonjetson/WorkSpace2026/Pyy1/)",
+      "Read(//home/jetsonjetson/WorkSpace2026/Pyy1/**)",
+      "Bash(unzip -o pyy666666666.zip -d extracted)"
+    ]
+  }
+}
